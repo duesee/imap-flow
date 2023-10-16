@@ -2,16 +2,52 @@ use std::pin::Pin;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
-// TODO: Reconsider this. Do we really need Stream + AnyStream? What is the smallest API that we need to expose?
+trait AsyncReadWrite: AsyncRead + AsyncWrite + Send {
+    fn read(self: Pin<&Self>) -> Pin<&(dyn AsyncRead + Send)>;
+    fn read_mut(self: Pin<&mut Self>) -> Pin<&mut (dyn AsyncRead + Send)>;
+    fn write(self: Pin<&Self>) -> Pin<&(dyn AsyncWrite + Send)>;
+    fn write_mut(self: Pin<&mut Self>) -> Pin<&mut (dyn AsyncWrite + Send)>;
+}
 
-pub trait Stream: AsyncRead + AsyncWrite + Send {}
+impl<S: AsyncRead + AsyncWrite + Send> AsyncReadWrite for S {
+    fn read(self: Pin<&Self>) -> Pin<&(dyn AsyncRead + Send)> {
+        self
+    }
+    fn read_mut(self: Pin<&mut Self>) -> Pin<&mut (dyn AsyncRead + Send)> {
+        self
+    }
+    fn write(self: Pin<&Self>) -> Pin<&(dyn AsyncWrite + Send)> {
+        self
+    }
+    fn write_mut(self: Pin<&mut Self>) -> Pin<&mut (dyn AsyncWrite + Send)> {
+        self
+    }
+}
 
-impl<S: AsyncRead + AsyncWrite + Send> Stream for S {}
+pub struct Stream {
+    underlying: Pin<Box<dyn AsyncReadWrite>>,
+}
 
-pub struct AnyStream(pub Pin<Box<dyn Stream>>);
+impl Stream {
+    pub fn new<S>(stream: S) -> Self
+    where
+        S: AsyncRead + AsyncWrite + Send + 'static,
+    {
+        Self {
+            underlying: Box::pin(stream),
+        }
+    }
 
-impl AnyStream {
-    pub fn new<S: Stream + 'static>(stream: S) -> Self {
-        Self(Box::pin(stream))
+    pub fn read(&self) -> Pin<&(dyn AsyncRead + Send)> {
+        self.underlying.as_ref().read()
+    }
+    pub fn read_mut(&mut self) -> Pin<&mut (dyn AsyncRead + Send)> {
+        self.underlying.as_mut().read_mut()
+    }
+    pub fn write(&self) -> Pin<&(dyn AsyncWrite + Send)> {
+        self.underlying.as_ref().write()
+    }
+    pub fn write_mut(&mut self) -> Pin<&mut (dyn AsyncWrite + Send)> {
+        self.underlying.as_mut().write_mut()
     }
 }

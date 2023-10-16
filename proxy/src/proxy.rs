@@ -4,7 +4,7 @@ use colored::Colorize;
 use imap_flow::{
     client::{ClientFlow, ClientFlowError, ClientFlowEvent, ClientFlowOptions},
     server::{ServerFlow, ServerFlowError, ServerFlowEvent, ServerFlowOptions},
-    stream::AnyStream,
+    stream::Stream,
 };
 use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream};
@@ -59,7 +59,7 @@ impl Proxy<BoundState> {
             service: self.service.clone(),
             state: ClientAcceptedState {
                 client_addr,
-                client_to_proxy: AnyStream::new(client_to_proxy),
+                client_to_proxy: Stream::new(client_to_proxy),
             },
         })
     }
@@ -67,7 +67,7 @@ impl Proxy<BoundState> {
 
 pub struct ClientAcceptedState {
     client_addr: SocketAddr,
-    client_to_proxy: AnyStream,
+    client_to_proxy: Stream,
 }
 
 impl State for ClientAcceptedState {}
@@ -117,15 +117,15 @@ impl Proxy<ClientAcceptedState> {
             service: self.service,
             state: ConnectedState {
                 client_to_proxy: self.state.client_to_proxy,
-                proxy_to_server: AnyStream::new(proxy_to_server),
+                proxy_to_server: Stream::new(proxy_to_server),
             },
         })
     }
 }
 
 pub struct ConnectedState {
-    client_to_proxy: AnyStream,
-    proxy_to_server: AnyStream,
+    client_to_proxy: Stream,
+    proxy_to_server: Stream,
 }
 
 impl State for ConnectedState {}

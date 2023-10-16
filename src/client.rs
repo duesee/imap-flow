@@ -14,7 +14,7 @@ use thiserror::Error;
 use crate::{
     receive::{ReceiveEvent, ReceiveState},
     send::SendCommandState,
-    stream::AnyStream,
+    stream::Stream,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -32,7 +32,7 @@ impl Default for ClientFlowOptions {
 }
 
 pub struct ClientFlow {
-    stream: AnyStream,
+    stream: Stream,
 
     next_command_handle: ClientFlowCommandHandle,
     send_command_state: SendCommandState<(Tag<'static>, ClientFlowCommandHandle)>,
@@ -41,7 +41,7 @@ pub struct ClientFlow {
 
 impl ClientFlow {
     pub async fn receive_greeting(
-        mut stream: AnyStream,
+        mut stream: Stream,
         options: ClientFlowOptions,
     ) -> Result<(Self, Greeting<'static>), ClientFlowError> {
         // Receive greeting
@@ -79,6 +79,14 @@ impl ClientFlow {
         };
 
         Ok((client_flow, greeting))
+    }
+
+    pub fn stream(&self) -> &Stream {
+        &self.stream
+    }
+
+    pub fn stream_mut(&mut self) -> &mut Stream {
+        &mut self.stream
     }
 
     pub fn enqueue_command(&mut self, command: Command<'_>) -> ClientFlowCommandHandle {

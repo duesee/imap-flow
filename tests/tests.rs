@@ -2,7 +2,7 @@ use imap_codec::imap_types::response::Greeting;
 use imap_flow::{
     client::{ClientFlow, ClientFlowOptions},
     server::{ServerFlow, ServerFlowOptions},
-    stream::AnyStream,
+    stream::Stream,
 };
 use tokio::net::{TcpListener, TcpStream};
 
@@ -21,7 +21,7 @@ async fn self_test() {
             let (stream, _) = listener.accept().await.unwrap();
 
             ServerFlow::send_greeting(
-                AnyStream::new(stream),
+                Stream::new(stream),
                 ServerFlowOptions::default(),
                 greeting.clone(),
             )
@@ -34,7 +34,7 @@ async fn self_test() {
 
     let (_, received_greeting) = {
         let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        ClientFlow::receive_greeting(AnyStream::new(stream), ClientFlowOptions::default())
+        ClientFlow::receive_greeting(Stream::new(stream), ClientFlowOptions::default())
             .await
             .unwrap()
     };

@@ -3,7 +3,7 @@ use bytes::{Buf, BytesMut};
 use imap_codec::decode::Decoder;
 use tokio::io::AsyncReadExt;
 
-use crate::stream::AnyStream;
+use crate::stream::Stream;
 
 pub struct ReceiveState<C: Decoder> {
     codec: C,
@@ -52,7 +52,7 @@ impl<C: Decoder> ReceiveState<C> {
 
     pub async fn progress(
         &mut self,
-        stream: &mut AnyStream,
+        stream: &mut Stream,
     ) -> Result<ReceiveEvent<C>, tokio::io::Error>
     where
         for<'a> C::Message<'a>: IntoBoundedStatic<Static = C::Message<'static>>,
@@ -74,7 +74,7 @@ impl<C: Decoder> ReceiveState<C> {
 
     async fn progress_line(
         &mut self,
-        stream: &mut AnyStream,
+        stream: &mut Stream,
     ) -> Result<Option<ReceiveEvent<C>>, tokio::io::Error>
     where
         for<'a> C::Message<'a>: IntoBoundedStatic<Static = C::Message<'static>>,
@@ -86,7 +86,7 @@ impl<C: Decoder> ReceiveState<C> {
             Some(crlf_result) => crlf_result,
             None => {
                 // No full line received yet, more data needed.
-                stream.0.read_buf(&mut self.read_buffer).await?;
+                stream.read_mut().read_buf(&mut self.read_buffer).await?;
                 return Ok(None);
             }
         };
@@ -112,14 +112,14 @@ impl<C: Decoder> ReceiveState<C> {
 
     async fn progress_literal(
         &mut self,
-        stream: &mut AnyStream,
+        stream: &mut Stream,
         literal_length: u32,
     ) -> Result<(), tokio::io::Error> {
         let unseen_bytes = self.read_buffer.len() - self.seen_bytes;
 
         if unseen_bytes < literal_length as usize {
             // We did not receive enough bytes for the literal yet.
-            stream.0.read_buf(&mut self.read_buffer).await?;
+            stream.read_mut().read_buf(&mut self.read_buffer).await?;
         } else {
             // We received enough bytes for the literal.
             // Now we can continue reading the next line.

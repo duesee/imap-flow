@@ -12,7 +12,7 @@ use thiserror::Error;
 use crate::{
     receive::{ReceiveEvent, ReceiveState},
     send::SendResponseState,
-    stream::AnyStream,
+    stream::Stream,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -33,7 +33,7 @@ impl Default for ServerFlowOptions {
 }
 
 pub struct ServerFlow {
-    stream: AnyStream,
+    stream: Stream,
     max_literal_size: u32,
 
     next_response_handle: ServerFlowResponseHandle,
@@ -43,7 +43,7 @@ pub struct ServerFlow {
 
 impl ServerFlow {
     pub async fn send_greeting(
-        mut stream: AnyStream,
+        mut stream: Stream,
         options: ServerFlowOptions,
         greeting: Greeting<'_>,
     ) -> Result<Self, ServerFlowError> {
@@ -69,6 +69,14 @@ impl ServerFlow {
         };
 
         Ok(server_flow)
+    }
+
+    pub fn stream(&self) -> &Stream {
+        &self.stream
+    }
+
+    pub fn stream_mut(&mut self) -> &mut Stream {
+        &mut self.stream
     }
 
     pub fn enqueue_data(&mut self, data: Data<'_>) -> ServerFlowResponseHandle {
