@@ -1,6 +1,7 @@
 use std::{fs::File, io::BufReader, path::Path};
 
 use imap_codec::imap_types::{
+    auth::AuthMechanism,
     core::NonEmptyVec,
     response::{
         Bye, Capability, Code, CommandContinuationRequest, CommandContinuationRequestBasic, Data,
@@ -99,12 +100,10 @@ pub fn filter_capabilities_in_continuation(continuation: &mut CommandContinuatio
 fn filter_capabilities(capabilities: NonEmptyVec<Capability>) -> NonEmptyVec<Capability> {
     let filtered: Vec<_> = capabilities
         .into_iter()
-        // TODO: We want to support other AUTH mechanisms, too. AUTH=PLAIN at least.
-        //       However, for this to work, the proxy needs to learn how to handle
-        //       IMAP authentication flows. This *should* be the last remaining
-        //       difficulty we (probably) want to solve for basic IMAP interop.
         .filter(|capability| match capability {
             Capability::Imap4Rev1 => true,
+            Capability::Auth(auth_mechanism) if is_auth_mechanism_proxyable(auth_mechanism) => true,
+            Capability::SaslIr => true,
             Capability::Quota | Capability::QuotaRes(_) | Capability::QuotaSet => true,
             Capability::Move => true,
             _ => false,
@@ -112,6 +111,19 @@ fn filter_capabilities(capabilities: NonEmptyVec<Capability>) -> NonEmptyVec<Cap
         .collect();
 
     NonEmptyVec::try_from(filtered).unwrap_or(NonEmptyVec::from(Capability::Imap4Rev1))
+}
+
+fn is_auth_mechanism_proxyable(auth_mechanism: &AuthMechanism) -> bool {
+    match auth_mechanism {
+        // Can be proxied, terminated, or upgraded
+        AuthMechanism::Plain | AuthMechanism::Login | AuthMechanism::XOAuth2 => true,
+        // Can be proxied
+        AuthMechanism::ScramSha1 | AuthMechanism::ScramSha256 => true,
+        // Cannot be proxied (due to session binding)
+        AuthMechanism::ScramSha1Plus | AuthMechanism::ScramSha256Plus => false,
+        // Unknown
+        _ => false,
+    }
 }
 
 // -------------------------------------------------------------------------------------------------

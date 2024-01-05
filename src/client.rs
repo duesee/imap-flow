@@ -4,21 +4,23 @@ use bytes::BytesMut;
 use imap_codec::{
     decode::{GreetingDecodeError, ResponseDecodeError},
     imap_types::{
+        auth::AuthenticateData,
         command::Command,
         response::{
             CommandContinuationRequest, Data, Greeting, Response, Status, StatusBody, StatusKind,
             Tagged,
         },
     },
-    CommandCodec, GreetingCodec, ResponseCodec,
+    AuthenticateDataCodec, CommandCodec, GreetingCodec, ResponseCodec,
 };
 use thiserror::Error;
 
 use crate::{
     handle::{Handle, HandleGenerator, HandleGeneratorGenerator, RawHandle},
     receive::{ReceiveEvent, ReceiveState},
-    send::SendCommandState,
+    send::{SendCommandEvent, SendCommandKind, SendCommandState},
     stream::{AnyStream, StreamError},
+    types::CommandAuthenticate,
 };
 
 static HANDLE_GENERATOR_GENERATOR: HandleGeneratorGenerator<ClientFlowCommandHandle> =
@@ -77,14 +79,14 @@ impl ClientFlow {
         };
 
         // Create state to send commands ...
-        let send_command_state = SendCommandState::new(CommandCodec::default(), BytesMut::new());
+        let send_command_state = SendCommandState::new(
+            CommandCodec::default(),
+            AuthenticateDataCodec::default(),
+            BytesMut::new(),
+        );
 
         // ..., and state to receive responses.
-        let receive_response_state = ReceiveState::new(
-            ResponseCodec::new(),
-            options.crlf_relaxed,
-            receive_greeting_state.finish(),
-        );
+        let receive_response_state = receive_greeting_state.change_codec(ResponseCodec::new());
 
         let client_flow = Self {
             stream,
@@ -128,24 +130,30 @@ impl ClientFlow {
         //
         // Therefore we prefer the second approach and begin with sending the commands.
         loop {
-            if let Some(event) = self.progress_command().await? {
+            if let Some(event) = self.progress_send().await? {
                 return Ok(event);
             }
 
-            if let Some(event) = self.progress_response().await? {
+            if let Some(event) = self.progress_receive().await? {
                 return Ok(event);
             }
         }
     }
 
-    async fn progress_command(&mut self) -> Result<Option<ClientFlowEvent>, ClientFlowError> {
+    async fn progress_send(&mut self) -> Result<Option<ClientFlowEvent>, ClientFlowError> {
         match self.send_command_state.progress(&mut self.stream).await? {
-            Some((handle, command)) => Ok(Some(ClientFlowEvent::CommandSent { handle, command })),
+            Some(SendCommandEvent::CommandSent {
+                key: handle,
+                command,
+            }) => Ok(Some(ClientFlowEvent::CommandSent { handle, command })),
+            Some(SendCommandEvent::CommandAuthenticateStarted { key: handle }) => {
+                Ok(Some(ClientFlowEvent::AuthenticateStarted { handle }))
+            }
             None => Ok(None),
         }
     }
 
-    async fn progress_response(&mut self) -> Result<Option<ClientFlowEvent>, ClientFlowError> {
+    async fn progress_receive(&mut self) -> Result<Option<ClientFlowEvent>, ClientFlowError> {
         let event = loop {
             let response = match self
                 .receive_response_state
@@ -175,20 +183,49 @@ impl ClientFlow {
 
             match response {
                 Response::Status(status) => {
-                    if let Some((handle, command)) = self.maybe_abort_command(&status) {
-                        break Some(ClientFlowEvent::CommandRejected {
-                            handle,
-                            command,
-                            status,
-                        });
+                    let event = if let Some(finish_result) = self.maybe_finish_command(&status) {
+                        match finish_result {
+                            FinishCommandResult::LiteralRejected { handle, command } => {
+                                ClientFlowEvent::CommandRejected {
+                                    handle,
+                                    command,
+                                    status,
+                                }
+                            }
+                            FinishCommandResult::AuthenticationAccepted {
+                                handle,
+                                command_authenticate,
+                            } => ClientFlowEvent::AuthenticateAccepted {
+                                handle,
+                                command_authenticate,
+                                status,
+                            },
+                            FinishCommandResult::AuthenticationRejected {
+                                handle,
+                                command_authenticate,
+                            } => ClientFlowEvent::AuthenticateRejected {
+                                handle,
+                                command_authenticate,
+                                status,
+                            },
+                        }
                     } else {
-                        break Some(ClientFlowEvent::StatusReceived { status });
-                    }
+                        ClientFlowEvent::StatusReceived { status }
+                    };
+
+                    break Some(event);
                 }
                 Response::Data(data) => break Some(ClientFlowEvent::DataReceived { data }),
                 Response::CommandContinuationRequest(continuation) => {
-                    if self.send_command_state.continue_command() {
+                    if self.send_command_state.continue_literal() {
+                        // We received a continuation that was necessary for sending a command.
+                        // So we abort receiving responses for now and continue with sending commands.
                         break None;
+                    } else if let Some(&handle) = self.send_command_state.continue_authenticate() {
+                        break Some(ClientFlowEvent::ContinuationAuthenticateReceived {
+                            handle,
+                            continuation,
+                        });
                     } else {
                         break Some(ClientFlowEvent::ContinuationReceived { continuation });
                     }
@@ -199,23 +236,97 @@ impl ClientFlow {
         Ok(event)
     }
 
-    fn maybe_abort_command(
-        &mut self,
-        status: &Status,
-    ) -> Option<(ClientFlowCommandHandle, Command<'static>)> {
-        let command = self.send_command_state.command_in_progress()?;
+    fn maybe_finish_command(&mut self, status: &Status) -> Option<FinishCommandResult> {
+        let command_kind = self.send_command_state.command_in_progress()?;
 
-        match status {
-            Status::Tagged(Tagged {
-                tag,
-                body: StatusBody { kind, .. },
-                ..
-            }) if *kind == StatusKind::Bad && tag == &command.tag => {
-                self.send_command_state.abort_command()
+        match command_kind {
+            SendCommandKind::Regular { command } => {
+                let removed_command = match status {
+                    Status::Tagged(Tagged {
+                        tag,
+                        body: StatusBody { kind, .. },
+                        ..
+                    }) if *kind == StatusKind::Bad && tag == &command.tag => {
+                        self.send_command_state.remove_command_in_progress()
+                    }
+                    _ => None,
+                };
+
+                if let Some((handle, SendCommandKind::Regular { command })) = removed_command {
+                    Some(FinishCommandResult::LiteralRejected { handle, command })
+                } else {
+                    None
+                }
             }
-            _ => None,
+            SendCommandKind::Authenticate {
+                command_authenticate,
+                ..
+            } => {
+                let removed_command = match status {
+                    Status::Tagged(Tagged {
+                        tag,
+                        body: StatusBody { kind, .. },
+                        ..
+                    }) if tag == &command_authenticate.tag => self
+                        .send_command_state
+                        .remove_command_in_progress()
+                        .zip(Some(kind.clone())),
+                    _ => None,
+                };
+
+                if let Some((
+                    (
+                        handle,
+                        SendCommandKind::Authenticate {
+                            command_authenticate,
+                            ..
+                        },
+                    ),
+                    status_kind,
+                )) = removed_command
+                {
+                    match status_kind {
+                        StatusKind::Ok => Some(FinishCommandResult::AuthenticationAccepted {
+                            handle,
+                            command_authenticate,
+                        }),
+                        StatusKind::No | StatusKind::Bad => {
+                            Some(FinishCommandResult::AuthenticationRejected {
+                                handle,
+                                command_authenticate,
+                            })
+                        }
+                    }
+                } else {
+                    None
+                }
+            }
         }
     }
+
+    pub fn authenticate_continue(
+        &mut self,
+        authenticate_data: AuthenticateData,
+    ) -> Result<ClientFlowCommandHandle, AuthenticateData> {
+        self.send_command_state
+            .continue_authenticate_with_data(authenticate_data)
+            .copied()
+    }
+}
+
+enum FinishCommandResult {
+    LiteralRejected {
+        handle: ClientFlowCommandHandle,
+        command: Command<'static>,
+    },
+    AuthenticationAccepted {
+        handle: ClientFlowCommandHandle,
+        command_authenticate: CommandAuthenticate,
+    },
+    AuthenticationRejected {
+        handle: ClientFlowCommandHandle,
+        command_authenticate: CommandAuthenticate,
+    },
 }
 
 /// A handle for an enqueued [`Command`].
@@ -267,17 +378,36 @@ pub enum ClientFlowEvent {
         /// (e.g. [`Code::Alert`](imap_codec::imap_types::response::Code::Alert)).
         status: Status<'static>,
     },
+    AuthenticateStarted {
+        handle: ClientFlowCommandHandle,
+    },
+    /// Server is requesting (more) authentication data.
+    ContinuationAuthenticateReceived {
+        /// Handle to the enqueued [`Command`].
+        handle: ClientFlowCommandHandle,
+        continuation: CommandContinuationRequest<'static>,
+    },
+    AuthenticateAccepted {
+        handle: ClientFlowCommandHandle,
+        command_authenticate: CommandAuthenticate,
+        status: Status<'static>,
+    },
+    AuthenticateRejected {
+        handle: ClientFlowCommandHandle,
+        command_authenticate: CommandAuthenticate,
+        status: Status<'static>,
+    },
     /// Server [`Data`] received.
-    DataReceived { data: Data<'static> },
+    DataReceived {
+        data: Data<'static>,
+    },
     /// Server [`Status`] received.
-    StatusReceived { status: Status<'static> },
+    StatusReceived {
+        status: Status<'static>,
+    },
     /// Server [`CommandContinuationRequest`] response received.
     ///
-    /// Note: The received continuation was not part of [`ClientFlow`] literal handling.
-    /// It is either ...
-    /// * an acknowledgement to send authentication data,
-    /// * an acknowledgement to proceed with IDLE,
-    /// * or an unsolicited continuation (in which case processing is deferred to the user).
+    /// Note: The received continuation was not part of [`ClientFlow`] handling.
     ContinuationReceived {
         continuation: CommandContinuationRequest<'static>,
     },

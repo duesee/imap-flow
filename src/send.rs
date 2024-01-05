@@ -3,15 +3,22 @@ use std::{collections::VecDeque, fmt::Debug};
 use bytes::BytesMut;
 use imap_codec::{
     encode::{Encoder, Fragment},
-    imap_types::command::Command,
-    CommandCodec,
+    imap_types::{
+        auth::AuthenticateData,
+        command::{Command, CommandBody},
+    },
+    AuthenticateDataCodec, CommandCodec,
 };
 
-use crate::stream::{AnyStream, StreamError};
+use crate::{
+    stream::{AnyStream, StreamError},
+    types::CommandAuthenticate,
+};
 
 #[derive(Debug)]
-pub struct SendCommandState<K> {
-    codec: CommandCodec,
+pub struct SendCommandState<K: Copy> {
+    command_codec: CommandCodec,
+    authenticate_data_codec: AuthenticateDataCodec,
     // The commands that should be send.
     send_queue: VecDeque<SendCommandQueueEntry<K>>,
     // State of the command that is currently being sent.
@@ -21,10 +28,15 @@ pub struct SendCommandState<K> {
     write_buffer: BytesMut,
 }
 
-impl<K> SendCommandState<K> {
-    pub fn new(codec: CommandCodec, write_buffer: BytesMut) -> Self {
+impl<K: Copy> SendCommandState<K> {
+    pub fn new(
+        command_codec: CommandCodec,
+        authenticate_data_codec: AuthenticateDataCodec,
+        write_buffer: BytesMut,
+    ) -> Self {
         Self {
-            codec,
+            command_codec,
+            authenticate_data_codec,
             send_queue: VecDeque::new(),
             send_progress: None,
             write_buffer,
@@ -32,46 +44,118 @@ impl<K> SendCommandState<K> {
     }
 
     pub fn enqueue(&mut self, key: K, command: Command<'static>) {
-        let fragments = self.codec.encode(&command).collect();
-        let entry = SendCommandQueueEntry {
-            key,
-            command,
-            fragments,
+        let fragments = self.command_codec.encode(&command).collect();
+        let kind = match command.body {
+            CommandBody::Authenticate {
+                mechanism,
+                initial_response,
+            } => SendCommandKind::Authenticate {
+                command_authenticate: CommandAuthenticate {
+                    tag: command.tag,
+                    mechanism,
+                    initial_response,
+                },
+                started: false,
+            },
+            body => SendCommandKind::Regular {
+                command: Command {
+                    tag: command.tag,
+                    body,
+                },
+            },
         };
-        self.send_queue.push_back(entry);
+        self.send_queue.push_back(SendCommandQueueEntry {
+            key,
+            kind,
+            fragments,
+        });
     }
 
-    pub fn command_in_progress(&self) -> Option<&Command<'static>> {
-        self.send_progress.as_ref().map(|x| &x.command)
+    pub fn command_in_progress(&self) -> Option<&SendCommandKind> {
+        self.send_progress.as_ref().map(|x| &x.kind)
     }
 
-    pub fn abort_command(&mut self) -> Option<(K, Command<'static>)> {
+    pub fn remove_command_in_progress(&mut self) -> Option<(K, SendCommandKind)> {
         self.write_buffer.clear();
         self.send_progress
             .take()
-            .map(|progress| (progress.key, progress.command))
+            .map(|progress| (progress.key, progress.kind))
     }
 
-    pub fn continue_command(&mut self) -> bool {
+    // TODO: Rename?
+    pub fn continue_literal(&mut self) -> bool {
         let Some(write_progress) = self.send_progress.as_mut() else {
             return false;
         };
-        let Some(literal_progress) = write_progress.next_literal.as_mut() else {
+        let Some(literal_progress) = write_progress.blocked_reason.as_mut() else {
             return false;
         };
-        if literal_progress.received_continue {
+        let SendCommandBlockedReason::WaitForLiteralAck {
+            received_continue, ..
+        } = literal_progress
+        else {
+            return false;
+        };
+        if *received_continue {
             return false;
         }
 
-        literal_progress.received_continue = true;
+        *received_continue = true;
 
         true
+    }
+
+    pub fn continue_authenticate(&mut self) -> Option<&K> {
+        let write_progress = self.send_progress.as_mut()?;
+        let literal_progress = write_progress.blocked_reason.as_mut()?;
+        let SendCommandBlockedReason::WaitForAuthenticateData {
+            received_continue, ..
+        } = literal_progress
+        else {
+            return None;
+        };
+        if *received_continue {
+            return None;
+        }
+
+        *received_continue = true;
+
+        Some(&write_progress.key)
+    }
+
+    pub fn continue_authenticate_with_data(
+        &mut self,
+        authenticate_data: AuthenticateData,
+    ) -> Result<&K, AuthenticateData> {
+        let Some(write_progress) = self.send_progress.as_mut() else {
+            return Err(authenticate_data);
+        };
+        let Some(literal_progress) = write_progress.blocked_reason.as_mut() else {
+            return Err(authenticate_data);
+        };
+        let SendCommandBlockedReason::WaitForAuthenticateData {
+            received_continue,
+            data,
+        } = literal_progress
+        else {
+            return Err(authenticate_data);
+        };
+        if !*received_continue {
+            return Err(authenticate_data);
+        }
+        if data.is_some() {
+            return Err(authenticate_data);
+        }
+
+        *data = Some(authenticate_data);
+
+        Ok(&write_progress.key)
     }
 
     pub async fn progress(
         &mut self,
         stream: &mut AnyStream,
-    ) -> Result<Option<(K, Command<'static>)>, StreamError> {
+    ) -> Result<Option<SendCommandEvent<K>>, StreamError> {
         let progress = match self.send_progress.take() {
             Some(progress) => {
                 // We are currently sending a command to the server. This sending process was
@@ -88,8 +172,8 @@ impl<K> SendCommandState<K> {
                 // Start sending the next command
                 SendCommandProgress {
                     key: entry.key,
-                    command: entry.command,
-                    next_literal: None,
+                    kind: entry.kind,
+                    blocked_reason: None,
                     next_fragments: entry.fragments,
                 }
             }
@@ -97,18 +181,57 @@ impl<K> SendCommandState<K> {
         let progress = self.send_progress.insert(progress);
 
         // Handle the outstanding literal first if there is one
-        if let Some(literal_progress) = progress.next_literal.take() {
-            if literal_progress.received_continue {
-                // We received a `Continue` from the server, we can send the literal now
-                self.write_buffer.extend(literal_progress.data);
-            } else {
-                // Delay this literal because we still wait for the `Continue` from the server
-                progress.next_literal = Some(literal_progress);
+        if let Some(suspended_reason) = progress.blocked_reason.take() {
+            match suspended_reason {
+                SendCommandBlockedReason::WaitForLiteralAck {
+                    data,
+                    received_continue,
+                } => {
+                    if received_continue {
+                        // We received a `Continue` from the server, we can send the literal now
+                        self.write_buffer.extend(data);
+                    } else {
+                        // Delay this literal because we still wait for the `Continue` from the server
+                        progress.blocked_reason =
+                            Some(SendCommandBlockedReason::WaitForLiteralAck {
+                                data,
+                                received_continue,
+                            });
 
-                // Make sure that the line before the literal is sent completely to the server
-                stream.write_all(&mut self.write_buffer).await?;
+                        // Make sure that the line before the literal is sent completely to the server
+                        stream.write_all(&mut self.write_buffer).await?;
 
-                return Ok(None);
+                        return Ok(None);
+                    }
+                }
+                SendCommandBlockedReason::WaitForAuthenticateData {
+                    received_continue,
+                    data,
+                } => {
+                    match data {
+                        Some(data) => {
+                            // The data can only be set after receiving a continue from server
+                            assert!(received_continue);
+
+                            // We received a `Continue` from the server and the auth data from the
+                            // client-flow user. We can send the auth data now.
+                            progress
+                                .next_fragments
+                                .extend(self.authenticate_data_codec.encode(&data))
+                        }
+                        None => {
+                            // Delay this because we still wait for the client flow user to call
+                            // `authenticate_continue`.
+                            progress.blocked_reason =
+                                Some(SendCommandBlockedReason::WaitForAuthenticateData {
+                                    received_continue,
+                                    data,
+                                });
+
+                            return Ok(None);
+                        }
+                    }
+                }
             }
         }
 
@@ -123,14 +246,15 @@ impl<K> SendCommandState<K> {
                         // TODO: Handle `LITERAL{+,-}`.
                         // Delay this literal because we need to wait for a `Continue` from
                         // the server
-                        progress.next_literal = Some(SendCommandLiteralProgress {
-                            data,
-                            received_continue: false,
-                        });
+                        progress.blocked_reason =
+                            Some(SendCommandBlockedReason::WaitForLiteralAck {
+                                data,
+                                received_continue: false,
+                            });
                         break true;
                     }
-                    Fragment::AuthData { .. } => {
-                        unimplemented!()
+                    Fragment::AuthData { data } => {
+                        self.write_buffer.extend(data);
                     }
                 }
             } else {
@@ -144,38 +268,97 @@ impl<K> SendCommandState<K> {
         if need_continue {
             Ok(None)
         } else {
-            // Command was sent completely
-            Ok(self
-                .send_progress
-                .take()
-                .map(|progress| (progress.key, progress.command)))
+            let Some(progress) = self.send_progress.take() else {
+                return Ok(None);
+            };
+
+            match progress.kind {
+                SendCommandKind::Regular { command } => {
+                    // Command was sent completely
+                    Ok(Some(SendCommandEvent::CommandSent {
+                        key: progress.key,
+                        command,
+                    }))
+                }
+                SendCommandKind::Authenticate {
+                    command_authenticate,
+                    started,
+                } => {
+                    // Authenticate is only treated as completed after receiving a "OK" from server
+                    let progress = self.send_progress.insert(SendCommandProgress {
+                        kind: SendCommandKind::Authenticate {
+                            command_authenticate,
+                            started: true, // asdfsdf
+                        },
+                        blocked_reason: Some(SendCommandBlockedReason::WaitForAuthenticateData {
+                            received_continue: false,
+                            data: None,
+                        }),
+                        ..progress
+                    });
+
+                    if started {
+                        Ok(None)
+                    } else {
+                        Ok(Some(SendCommandEvent::CommandAuthenticateStarted {
+                            key: progress.key,
+                        }))
+                    }
+                }
+            }
         }
     }
+}
+
+pub enum SendCommandEvent<K> {
+    CommandSent { key: K, command: Command<'static> },
+    CommandAuthenticateStarted { key: K },
+}
+
+// TODO: Better name?
+#[derive(Debug)]
+pub enum SendCommandKind {
+    Regular {
+        command: Command<'static>,
+    },
+    Authenticate {
+        command_authenticate: CommandAuthenticate,
+        started: bool,
+    },
 }
 
 #[derive(Debug)]
 struct SendCommandQueueEntry<K> {
     key: K,
-    command: Command<'static>,
+    kind: SendCommandKind,
     fragments: VecDeque<Fragment>,
 }
 
 #[derive(Debug)]
 struct SendCommandProgress<K> {
     key: K,
-    command: Command<'static>,
-    // If defined this literal need to be sent before `next_fragments`.
-    next_literal: Option<SendCommandLiteralProgress>,
+    kind: SendCommandKind,
+    // If defined we need to wait for something before we can send `next_fragments`.
+    blocked_reason: Option<SendCommandBlockedReason>,
     // The fragments that need to be sent.
     next_fragments: VecDeque<Fragment>,
 }
 
 #[derive(Debug)]
-struct SendCommandLiteralProgress {
-    // The bytes of the literal.
-    data: Vec<u8>,
-    // Was the literal already acknowledged by a `Continue` from the server?
-    received_continue: bool,
+enum SendCommandBlockedReason {
+    WaitForLiteralAck {
+        // The bytes of the literal.
+        data: Vec<u8>,
+        // Was the literal already acknowledged by a `Continue` from the server?
+        received_continue: bool,
+    },
+    WaitForAuthenticateData {
+        // Was the authenticate data already requested by the server?
+        received_continue: bool,
+        // The authenticate data provided by the client flow user.
+        // Should only be set when requested by the server.
+        data: Option<AuthenticateData>,
+    },
 }
 
 #[derive(Debug)]

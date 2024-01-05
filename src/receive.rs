@@ -46,10 +46,6 @@ impl<C: Decoder> ReceiveState<C> {
         discarded_bytes
     }
 
-    pub fn finish(self) -> BytesMut {
-        self.read_buffer
-    }
-
     pub async fn progress(&mut self, stream: &mut AnyStream) -> Result<ReceiveEvent<C>, StreamError>
     where
         for<'a> C::Message<'a>: IntoBoundedStatic<Static = C::Message<'static>>,
@@ -125,6 +121,10 @@ impl<C: Decoder> ReceiveState<C> {
         }
 
         Ok(())
+    }
+
+    pub fn change_codec<D: Decoder>(self, codec: D) -> ReceiveState<D> {
+        ReceiveState::new(codec, self.crlf_relaxed, self.read_buffer)
     }
 }
 

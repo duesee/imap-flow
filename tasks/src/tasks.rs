@@ -2,10 +2,14 @@
 //!
 //! The tasks here correspond to the invocation (and processing) of a single command.
 
+use std::borrow::Cow;
+
 use imap_codec::imap_types::{
+    auth::{AuthMechanism, AuthenticateData},
     command::CommandBody,
     core::NonEmptyVec,
-    response::{Bye, Capability, Data, StatusBody, StatusKind},
+    response::{Bye, Capability, CommandContinuationRequest, Data, StatusBody, StatusKind},
+    secret::Secret,
 };
 
 use crate::Task;
@@ -71,5 +75,52 @@ impl Task for LogoutTask {
             StatusKind::No => Err("unexpected NO result"),
             StatusKind::Bad => Err("command unknown or arguments invalid"),
         }
+    }
+}
+
+pub struct AuthenticatePlainTask {
+    line: Option<Vec<u8>>,
+    ir: bool,
+}
+
+impl AuthenticatePlainTask {
+    pub fn new(username: &str, password: &str, ir: bool) -> Self {
+        Self {
+            line: Some(format!("\x00{}\x00{}", username, password).into_bytes()),
+            ir,
+        }
+    }
+}
+
+impl Task for AuthenticatePlainTask {
+    type Output = Result<(), ()>;
+
+    fn command_body(&self) -> CommandBody<'static> {
+        CommandBody::Authenticate {
+            mechanism: AuthMechanism::Plain,
+            initial_response: if self.ir {
+                // TODO: command_body must only be called once... hm...
+                Some(Secret::new(Cow::Owned(self.line.clone().unwrap())))
+            } else {
+                None
+            },
+        }
+    }
+
+    fn process_continuation_authenticate(
+        &mut self,
+        _: CommandContinuationRequest<'static>,
+    ) -> Result<AuthenticateData, CommandContinuationRequest<'static>> {
+        if self.ir {
+            Ok(AuthenticateData::Cancel)
+        } else if let Some(line) = self.line.take() {
+            Ok(AuthenticateData::Continue(Secret::new(line)))
+        } else {
+            Ok(AuthenticateData::Cancel)
+        }
+    }
+
+    fn process_tagged(self, _: StatusBody<'static>) -> Self::Output {
+        Ok(())
     }
 }

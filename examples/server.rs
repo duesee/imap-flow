@@ -40,6 +40,9 @@ async fn main() {
                 println!("response sent: {response:?}");
                 assert_eq!(handle, Some(got_handle));
             }
+            event => {
+                println!("{event:?}");
+            }
         }
     }
 }

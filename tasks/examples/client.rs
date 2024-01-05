@@ -4,7 +4,7 @@ use imap_flow::{
     stream::AnyStream,
 };
 use tasks::{
-    tasks::{CapabilityTask, LogoutTask},
+    tasks::{AuthenticatePlainTask, CapabilityTask, LogoutTask},
     Scheduler, SchedulerEvent,
 };
 use tokio::net::TcpStream;
@@ -24,17 +24,37 @@ async fn main() {
     };
 
     let handle1 = scheduler.enqueue_task(CapabilityTask::default());
-    let handle2 = scheduler.enqueue_task(LogoutTask::default());
 
     loop {
         match scheduler.progress().await.unwrap() {
             SchedulerEvent::TaskFinished(mut token) => {
                 if let Some(capability) = handle1.resolve(&mut token) {
                     println!("handle1: {capability:?}");
+                    break;
+                }
+            }
+            SchedulerEvent::Unsolicited(unsolicited) => {
+                println!("unsolicited: {unsolicited:?}");
+
+                if let Response::Status(Status::Bye { .. }) = unsolicited {
+                    break;
+                }
+            }
+        }
+    }
+
+    let handle2 = scheduler.enqueue_task(AuthenticatePlainTask::new("alice", "pa²²w0rd", true));
+    let handle3 = scheduler.enqueue_task(LogoutTask::default());
+
+    loop {
+        match scheduler.progress().await.unwrap() {
+            SchedulerEvent::TaskFinished(mut token) => {
+                if let Some(auth) = handle2.resolve(&mut token) {
+                    println!("handle2: {auth:?}");
                 }
 
-                if let Some(logout) = handle2.resolve(&mut token) {
-                    println!("handle2: {logout:?}");
+                if let Some(logout) = handle3.resolve(&mut token) {
+                    println!("handle3: {logout:?}");
                     break;
                 }
             }

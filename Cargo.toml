@@ -12,6 +12,8 @@ thiserror = "1.0.49"
 tokio = { version = "1.32.0", features = ["io-util"] }
 
 [dev-dependencies]
+rand = "0.8.5"
+tag-generator = { path = "tag-generator" }
 tokio = { version = "1.32.0", features = ["macros", "net", "rt"] }
 
 [workspace]
