@@ -412,6 +412,11 @@ impl ServerFlow {
             Err(status)
         }
     }
+
+    #[cfg(feature = "expose_stream")]
+    pub fn stream_mut(&mut self) -> &mut AnyStream {
+        &mut self.stream
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

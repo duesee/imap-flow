@@ -356,6 +356,11 @@ impl ClientFlow {
     pub fn idle_done(&mut self) -> Option<ClientFlowCommandHandle> {
         self.send_command_state.idle_done().copied()
     }
+
+    #[cfg(feature = "expose_stream")]
+    pub fn stream_mut(&mut self) -> &mut AnyStream {
+        &mut self.stream
+    }
 }
 
 enum FinishCommandResult {
