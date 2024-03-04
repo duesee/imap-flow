@@ -22,7 +22,7 @@ use crate::{
     handle::{Handle, HandleGenerator, HandleGeneratorGenerator, RawHandle},
     receive::{ReceiveEvent, ReceiveState},
     send_response::{SendResponseEvent, SendResponseState},
-    stream::{AnyStream, StreamError},
+    stream::{AnyStream, ReadBuffer, ReadError, WriteBuffer, WriteError},
     types::CommandAuthenticate,
 };
 
@@ -34,6 +34,7 @@ static HANDLE_GENERATOR_GENERATOR: HandleGeneratorGenerator<ServerFlowResponseHa
 pub struct ServerFlowOptions {
     pub crlf_relaxed: bool,
     pub max_literal_size: u32,
+    pub max_command_size: u32,
     pub literal_accept_text: Text<'static>,
     pub literal_reject_text: Text<'static>,
 }
@@ -45,6 +46,8 @@ impl Default for ServerFlowOptions {
             crlf_relaxed: false,
             // 25 MiB is a common maximum email size (Oct. 2023)
             max_literal_size: 25 * 1024 * 1024,
+            // TODO jakoschiko: why?
+            max_command_size: 50 * 1024 * 1024,
             // Short unmeaning text
             literal_accept_text: Text::unvalidated("..."),
             // Short unmeaning text
@@ -77,7 +80,9 @@ impl ServerFlow {
         greeting: Greeting<'static>,
     ) -> Result<(Self, Greeting<'static>), ServerFlowError> {
         // Send greeting
-        let write_buffer = BytesMut::new();
+        let write_buffer = WriteBuffer {
+            bytes: BytesMut::new(),
+        };
         let mut send_greeting_state =
             SendResponseState::new(GreetingCodec::default(), write_buffer);
         send_greeting_state.enqueue(None, greeting);
@@ -93,7 +98,10 @@ impl ServerFlow {
         // Successfully sent greeting, construct instance
         let write_buffer = send_greeting_state.finish();
         let send_response_state = SendResponseState::new(ResponseCodec::default(), write_buffer);
-        let read_buffer = BytesMut::new();
+        let read_buffer = ReadBuffer {
+            bytes: BytesMut::new(),
+            limit: Some(options.max_command_size as usize),
+        };
         let receive_command_state =
             ReceiveState::new(CommandCodec::default(), options.crlf_relaxed, read_buffer);
         let server_flow = Self {
@@ -202,8 +210,8 @@ impl ServerFlow {
     async fn progress_receive(&mut self) -> Result<Option<ServerFlowEvent>, ServerFlowError> {
         match &mut self.receive_command_state {
             ServerReceiveState::Command(state) => {
-                match state.progress(&mut self.stream).await? {
-                    ReceiveEvent::DecodingSuccess(command) => {
+                match state.progress(&mut self.stream).await {
+                    Ok(ReceiveEvent::DecodingSuccess(command)) => {
                         state.finish_message();
 
                         match command.body {
@@ -238,11 +246,11 @@ impl ServerFlow {
                             })),
                         }
                     }
-                    ReceiveEvent::DecodingFailure(CommandDecodeError::LiteralFound {
+                    Ok(ReceiveEvent::DecodingFailure(CommandDecodeError::LiteralFound {
                         tag,
                         length,
                         mode,
-                    }) => {
+                    })) => {
                         if length > self.options.max_literal_size {
                             match mode {
                                 LiteralMode::Sync => {
@@ -258,11 +266,9 @@ impl ServerFlow {
                                     self.send_response_state
                                         .enqueue(None, Response::Status(status));
 
-                                    let discarded_bytes = state.discard_message();
+                                    let discarded_bytes = state.discard_message().into();
 
-                                    Err(ServerFlowError::LiteralTooLong {
-                                        discarded_bytes: Secret::new(discarded_bytes),
-                                    })
+                                    Err(ServerFlowError::LiteralTooLong { discarded_bytes })
                                 }
                                 LiteralMode::NonSync => {
                                     // TODO: We can't (reliably) make the client stop sending data.
@@ -273,11 +279,9 @@ impl ServerFlow {
                                     //       * ...
                                     //
                                     //       The LITERAL+ RFC has some recommendations.
-                                    let discarded_bytes = state.discard_message();
+                                    let discarded_bytes = state.discard_message().into();
 
-                                    Err(ServerFlowError::LiteralTooLong {
-                                        discarded_bytes: Secret::new(discarded_bytes),
-                                    })
+                                    Err(ServerFlowError::LiteralTooLong { discarded_bytes })
                                 }
                             }
                         } else {
@@ -305,44 +309,48 @@ impl ServerFlow {
                             Ok(None)
                         }
                     }
-                    ReceiveEvent::DecodingFailure(
+                    Ok(ReceiveEvent::DecodingFailure(
                         CommandDecodeError::Failed | CommandDecodeError::Incomplete,
-                    ) => {
-                        let discarded_bytes = state.discard_message();
-                        Err(ServerFlowError::MalformedMessage {
-                            discarded_bytes: Secret::new(discarded_bytes),
-                        })
+                    )) => {
+                        let discarded_bytes = state.discard_message().into();
+                        Err(ServerFlowError::MalformedMessage { discarded_bytes })
                     }
-                    ReceiveEvent::ExpectedCrlfGotLf => {
-                        let discarded_bytes = state.discard_message();
-                        Err(ServerFlowError::ExpectedCrlfGotLf {
-                            discarded_bytes: Secret::new(discarded_bytes),
-                        })
+                    Ok(ReceiveEvent::ExpectedCrlfGotLf) => {
+                        let discarded_bytes = state.discard_message().into();
+                        Err(ServerFlowError::ExpectedCrlfGotLf { discarded_bytes })
+                    }
+                    Err(ReadError::Closed) => Err(ServerFlowError::StreamClosed),
+                    Err(ReadError::Io(err)) => Err(ServerFlowError::Io(err)),
+                    Err(ReadError::ReadBufferOverflow) => {
+                        let discarded_bytes = state.discard_all_bytes().into();
+                        Err(ServerFlowError::CommandTooLong { discarded_bytes })
                     }
                 }
             }
             ServerReceiveState::AuthenticateData(state) => {
-                match state.progress(&mut self.stream).await? {
-                    ReceiveEvent::DecodingSuccess(authenticate_data) => {
+                match state.progress(&mut self.stream).await {
+                    Ok(ReceiveEvent::DecodingSuccess(authenticate_data)) => {
                         state.finish_message();
                         Ok(Some(ServerFlowEvent::AuthenticateDataReceived {
                             authenticate_data,
                         }))
                     }
-                    ReceiveEvent::DecodingFailure(
+                    Ok(ReceiveEvent::DecodingFailure(
                         AuthenticateDataDecodeError::Failed
                         | AuthenticateDataDecodeError::Incomplete,
-                    ) => {
-                        let discarded_bytes = state.discard_message();
-                        Err(ServerFlowError::MalformedMessage {
-                            discarded_bytes: Secret::new(discarded_bytes),
-                        })
+                    )) => {
+                        let discarded_bytes = state.discard_message().into();
+                        Err(ServerFlowError::MalformedMessage { discarded_bytes })
                     }
-                    ReceiveEvent::ExpectedCrlfGotLf => {
-                        let discarded_bytes = state.discard_message();
-                        Err(ServerFlowError::ExpectedCrlfGotLf {
-                            discarded_bytes: Secret::new(discarded_bytes),
-                        })
+                    Ok(ReceiveEvent::ExpectedCrlfGotLf) => {
+                        let discarded_bytes = state.discard_message().into();
+                        Err(ServerFlowError::ExpectedCrlfGotLf { discarded_bytes })
+                    }
+                    Err(ReadError::Closed) => Err(ServerFlowError::StreamClosed),
+                    Err(ReadError::Io(err)) => Err(ServerFlowError::Io(err)),
+                    Err(ReadError::ReadBufferOverflow) => {
+                        let discarded_bytes = state.discard_all_bytes().into();
+                        Err(ServerFlowError::CommandTooLong { discarded_bytes })
                     }
                 }
             }
@@ -352,8 +360,8 @@ impl ServerFlow {
                 // `idle_accept` or `idle_reject`.
                 pending().await
             }
-            ServerReceiveState::IdleDone(state) => match state.progress(&mut self.stream).await? {
-                ReceiveEvent::DecodingSuccess(IdleDone) => {
+            ServerReceiveState::IdleDone(state) => match state.progress(&mut self.stream).await {
+                Ok(ReceiveEvent::DecodingSuccess(IdleDone)) => {
                     state.finish_message();
 
                     self.receive_command_state
@@ -361,19 +369,21 @@ impl ServerFlow {
 
                     Ok(Some(ServerFlowEvent::IdleDoneReceived))
                 }
-                ReceiveEvent::DecodingFailure(
+                Ok(ReceiveEvent::DecodingFailure(
                     IdleDoneDecodeError::Failed | IdleDoneDecodeError::Incomplete,
-                ) => {
-                    let discarded_bytes = state.discard_message();
-                    Err(ServerFlowError::MalformedMessage {
-                        discarded_bytes: Secret::new(discarded_bytes),
-                    })
+                )) => {
+                    let discarded_bytes = state.discard_message().into();
+                    Err(ServerFlowError::MalformedMessage { discarded_bytes })
                 }
-                ReceiveEvent::ExpectedCrlfGotLf => {
-                    let discarded_bytes = state.discard_message();
-                    Err(ServerFlowError::ExpectedCrlfGotLf {
-                        discarded_bytes: Secret::new(discarded_bytes),
-                    })
+                Ok(ReceiveEvent::ExpectedCrlfGotLf) => {
+                    let discarded_bytes = state.discard_message().into();
+                    Err(ServerFlowError::ExpectedCrlfGotLf { discarded_bytes })
+                }
+                Err(ReadError::Closed) => Err(ServerFlowError::StreamClosed),
+                Err(ReadError::Io(err)) => Err(ServerFlowError::Io(err)),
+                Err(ReadError::ReadBufferOverflow) => {
+                    let discarded_bytes = state.discard_all_bytes().into();
+                    Err(ServerFlowError::CommandTooLong { discarded_bytes })
                 }
             },
             ServerReceiveState::Dummy => {
@@ -587,14 +597,27 @@ pub enum ServerFlowEvent {
 
 #[derive(Debug, Error)]
 pub enum ServerFlowError {
+    #[error("Stream was closed")]
+    StreamClosed,
     #[error(transparent)]
-    Stream(#[from] StreamError),
+    Io(#[from] tokio::io::Error),
     #[error("Expected `\\r\\n`, got `\\n`")]
     ExpectedCrlfGotLf { discarded_bytes: Secret<Box<[u8]>> },
     #[error("Received malformed message")]
     MalformedMessage { discarded_bytes: Secret<Box<[u8]>> },
     #[error("Literal was rejected because it was too long")]
     LiteralTooLong { discarded_bytes: Secret<Box<[u8]>> },
+    #[error("Command was rejected because it was too long")]
+    CommandTooLong { discarded_bytes: Secret<Box<[u8]>> },
+}
+
+impl From<WriteError> for ServerFlowError {
+    fn from(err: WriteError) -> Self {
+        match err {
+            WriteError::Closed => Self::StreamClosed,
+            WriteError::Io(err) => Self::Io(err),
+        }
+    }
 }
 
 /// A dummy codec we use for technical reasons when we don't want to receive anything at all.

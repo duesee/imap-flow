@@ -1,6 +1,5 @@
 use std::collections::VecDeque;
 
-use bytes::BytesMut;
 use imap_codec::{
     encode::{Encoder, Fragment},
     AuthenticateDataCodec, CommandCodec, IdleDoneCodec,
@@ -16,7 +15,7 @@ use tracing::warn;
 
 use crate::{
     client::ClientFlowCommandHandle,
-    stream::{AnyStream, StreamError},
+    stream::{AnyStream, WriteBuffer, WriteError},
     types::CommandAuthenticate,
 };
 
@@ -32,7 +31,7 @@ pub struct SendCommandState {
     /// Note that this buffer can be non-empty even if `current_command` is `None`
     /// because commands can be aborted (see `maybe_terminate`) but partially sent
     /// fragment must never be aborted.
-    write_buffer: BytesMut,
+    write_buffer: WriteBuffer,
 }
 
 impl SendCommandState {
@@ -40,7 +39,7 @@ impl SendCommandState {
         command_codec: CommandCodec,
         authenticate_data_codec: AuthenticateDataCodec,
         idle_done_codec: IdleDoneCodec,
-        write_buffer: BytesMut,
+        write_buffer: WriteBuffer,
     ) -> Self {
         Self {
             command_codec,
@@ -291,7 +290,7 @@ impl SendCommandState {
     pub async fn progress(
         &mut self,
         stream: &mut AnyStream,
-    ) -> Result<Option<SendCommandEvent>, StreamError> {
+    ) -> Result<Option<SendCommandEvent>, WriteError> {
         let current_command = match self.current_command.take() {
             Some(current_command) => {
                 // We are currently sending a command but the sending process was aborted for one
@@ -414,7 +413,7 @@ enum CurrentCommand {
 
 impl CurrentCommand {
     /// Pushes as many bytes as possible from the command to the buffer.
-    fn push_to_buffer(self, write_buffer: &mut BytesMut) -> Self {
+    fn push_to_buffer(self, write_buffer: &mut WriteBuffer) -> Self {
         match self {
             Self::Command(state) => Self::Command(state.push_to_buffer(write_buffer)),
             Self::Authenticate(state) => Self::Authenticate(state.push_to_buffer(write_buffer)),
@@ -469,13 +468,13 @@ struct CommandState {
 }
 
 impl CommandState {
-    fn push_to_buffer(self, write_buffer: &mut BytesMut) -> Self {
+    fn push_to_buffer(self, write_buffer: &mut WriteBuffer) -> Self {
         let mut fragments = self.fragments;
         let activity = match self.activity {
             CommandActivity::PushingFragments { accepted_literal } => {
                 // First push the accepted literal if available
                 if let Some(data) = accepted_literal {
-                    write_buffer.extend(data);
+                    write_buffer.bytes.extend(data);
                 }
 
                 // Push as many fragments as possible
@@ -488,7 +487,7 @@ impl CommandState {
                                 mode: LiteralMode::NonSync,
                             },
                         ) => {
-                            write_buffer.extend(data);
+                            write_buffer.bytes.extend(data);
                         }
                         Some(Fragment::Literal {
                             data,
@@ -566,14 +565,14 @@ struct AuthenticateState {
 }
 
 impl AuthenticateState {
-    fn push_to_buffer(self, write_buffer: &mut BytesMut) -> Self {
+    fn push_to_buffer(self, write_buffer: &mut WriteBuffer) -> Self {
         let activity = match self.activity {
             AuthenticateActivity::PushingAuthenticate { authenticate } => {
-                write_buffer.extend(authenticate);
+                write_buffer.bytes.extend(authenticate);
                 AuthenticateActivity::WaitingForAuthenticateSent
             }
             AuthenticateActivity::PushingAuthenticateData { authenticate_data } => {
-                write_buffer.extend(authenticate_data);
+                write_buffer.bytes.extend(authenticate_data);
                 AuthenticateActivity::WaitingForAuthenticateDataSent
             }
             activity => activity,
@@ -635,14 +634,14 @@ struct IdleState {
 }
 
 impl IdleState {
-    fn push_to_buffer(self, write_buffer: &mut BytesMut) -> Self {
+    fn push_to_buffer(self, write_buffer: &mut WriteBuffer) -> Self {
         let activity = match self.activity {
             IdleActivity::PushingIdle { idle } => {
-                write_buffer.extend(idle);
+                write_buffer.bytes.extend(idle);
                 IdleActivity::WaitingForIdleSent
             }
             IdleActivity::PushingIdleDone { idle_done } => {
-                write_buffer.extend(idle_done);
+                write_buffer.bytes.extend(idle_done);
                 IdleActivity::WaitingForIdleDoneSent
             }
             activity => activity,

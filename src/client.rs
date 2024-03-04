@@ -17,7 +17,7 @@ use crate::{
     handle::{Handle, HandleGenerator, HandleGeneratorGenerator, RawHandle},
     receive::{ReceiveEvent, ReceiveState},
     send_command::{SendCommandEvent, SendCommandState, SendCommandTermination},
-    stream::{AnyStream, StreamError},
+    stream::{AnyStream, ReadBuffer, ReadError, WriteBuffer, WriteError},
     types::CommandAuthenticate,
 };
 
@@ -61,39 +61,46 @@ impl ClientFlow {
         options: ClientFlowOptions,
     ) -> Result<(Self, Greeting<'static>), ClientFlowError> {
         // Receive greeting.
-        let mut receive_greeting_state = ReceiveState::new(
-            GreetingCodec::default(),
-            options.crlf_relaxed,
-            BytesMut::new(),
-        );
+        let read_buffer = ReadBuffer {
+            bytes: BytesMut::new(),
+            // No limit is set because we trust the server
+            limit: None,
+        };
+        let mut receive_greeting_state =
+            ReceiveState::new(GreetingCodec::default(), options.crlf_relaxed, read_buffer);
 
-        let greeting = match receive_greeting_state.progress(&mut stream).await? {
-            ReceiveEvent::DecodingSuccess(greeting) => {
+        let greeting = match receive_greeting_state.progress(&mut stream).await {
+            Ok(ReceiveEvent::DecodingSuccess(greeting)) => {
                 receive_greeting_state.finish_message();
                 greeting
             }
-            ReceiveEvent::DecodingFailure(
+            Ok(ReceiveEvent::DecodingFailure(
                 GreetingDecodeError::Failed | GreetingDecodeError::Incomplete,
-            ) => {
-                let discarded_bytes = receive_greeting_state.discard_message();
-                return Err(ClientFlowError::MalformedMessage {
-                    discarded_bytes: Secret::new(discarded_bytes),
-                });
+            )) => {
+                let discarded_bytes = receive_greeting_state.discard_message().into();
+                return Err(ClientFlowError::MalformedMessage { discarded_bytes });
             }
-            ReceiveEvent::ExpectedCrlfGotLf => {
-                let discarded_bytes = receive_greeting_state.discard_message();
-                return Err(ClientFlowError::ExpectedCrlfGotLf {
-                    discarded_bytes: Secret::new(discarded_bytes),
-                });
+            Ok(ReceiveEvent::ExpectedCrlfGotLf) => {
+                let discarded_bytes = receive_greeting_state.discard_message().into();
+                return Err(ClientFlowError::ExpectedCrlfGotLf { discarded_bytes });
+            }
+            Err(ReadError::Closed) => return Err(ClientFlowError::StreamClosed),
+            Err(ReadError::Io(err)) => return Err(ClientFlowError::Io(err)),
+            Err(ReadError::ReadBufferOverflow) => {
+                // Unreachable because limit is not set for read buffer.
+                unreachable!()
             }
         };
 
         // Create state to send commands ...
+        let write_buffer = WriteBuffer {
+            bytes: BytesMut::new(),
+        };
         let send_command_state = SendCommandState::new(
             CommandCodec::default(),
             AuthenticateDataCodec::default(),
             IdleDoneCodec::default(),
-            BytesMut::new(),
+            write_buffer,
         );
 
         // ..., and state to receive responses.
@@ -171,33 +178,31 @@ impl ClientFlow {
 
     async fn progress_receive(&mut self) -> Result<Option<ClientFlowEvent>, ClientFlowError> {
         let event = loop {
-            let response = match self
-                .receive_response_state
-                .progress(&mut self.stream)
-                .await?
-            {
-                ReceiveEvent::DecodingSuccess(response) => {
+            let response = match self.receive_response_state.progress(&mut self.stream).await {
+                Ok(ReceiveEvent::DecodingSuccess(response)) => {
                     self.receive_response_state.finish_message();
                     response
                 }
-                ReceiveEvent::DecodingFailure(ResponseDecodeError::LiteralFound { length }) => {
+                Ok(ReceiveEvent::DecodingFailure(ResponseDecodeError::LiteralFound { length })) => {
                     // The client must accept the literal in any case.
                     self.receive_response_state.start_literal(length);
                     continue;
                 }
-                ReceiveEvent::DecodingFailure(
+                Ok(ReceiveEvent::DecodingFailure(
                     ResponseDecodeError::Failed | ResponseDecodeError::Incomplete,
-                ) => {
-                    let discarded_bytes = self.receive_response_state.discard_message();
-                    return Err(ClientFlowError::MalformedMessage {
-                        discarded_bytes: Secret::new(discarded_bytes),
-                    });
+                )) => {
+                    let discarded_bytes = self.receive_response_state.discard_message().into();
+                    return Err(ClientFlowError::MalformedMessage { discarded_bytes });
                 }
-                ReceiveEvent::ExpectedCrlfGotLf => {
-                    let discarded_bytes = self.receive_response_state.discard_message();
-                    return Err(ClientFlowError::ExpectedCrlfGotLf {
-                        discarded_bytes: Secret::new(discarded_bytes),
-                    });
+                Ok(ReceiveEvent::ExpectedCrlfGotLf) => {
+                    let discarded_bytes = self.receive_response_state.discard_message().into();
+                    return Err(ClientFlowError::ExpectedCrlfGotLf { discarded_bytes });
+                }
+                Err(ReadError::Closed) => return Err(ClientFlowError::StreamClosed),
+                Err(ReadError::Io(err)) => return Err(ClientFlowError::Io(err)),
+                Err(ReadError::ReadBufferOverflow) => {
+                    // Unreachable because limit is not set for read buffer.
+                    unreachable!()
                 }
             };
 
@@ -386,10 +391,21 @@ pub enum ClientFlowEvent {
 
 #[derive(Debug, Error)]
 pub enum ClientFlowError {
+    #[error("Stream was closed")]
+    StreamClosed,
     #[error(transparent)]
-    Stream(#[from] StreamError),
+    Io(#[from] tokio::io::Error),
     #[error("Expected `\\r\\n`, got `\\n`")]
     ExpectedCrlfGotLf { discarded_bytes: Secret<Box<[u8]>> },
     #[error("Received malformed message")]
     MalformedMessage { discarded_bytes: Secret<Box<[u8]>> },
+}
+
+impl From<WriteError> for ClientFlowError {
+    fn from(err: WriteError) -> Self {
+        match err {
+            WriteError::Closed => Self::StreamClosed,
+            WriteError::Io(err) => Self::Io(err),
+        }
+    }
 }

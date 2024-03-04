@@ -1,11 +1,10 @@
 use std::collections::VecDeque;
 
-use bytes::BytesMut;
 use imap_codec::encode::{Encoder, Fragment};
 
 use crate::{
     server::ServerFlowResponseHandle,
-    stream::{AnyStream, StreamError},
+    stream::{AnyStream, WriteBuffer, WriteError},
 };
 
 pub struct SendResponseState<C: Encoder> {
@@ -16,11 +15,11 @@ pub struct SendResponseState<C: Encoder> {
     current_response: Option<CurrentResponse<C>>,
     // Used for writing the current response to the stream.
     // Should be empty if `current_response` is `None`.
-    write_buffer: BytesMut,
+    write_buffer: WriteBuffer,
 }
 
 impl<C: Encoder> SendResponseState<C> {
-    pub fn new(codec: C, write_buffer: BytesMut) -> Self {
+    pub fn new(codec: C, write_buffer: WriteBuffer) -> Self {
         Self {
             codec,
             queued_responses: VecDeque::new(),
@@ -38,15 +37,15 @@ impl<C: Encoder> SendResponseState<C> {
             .push_back(QueuedResponse { handle, response });
     }
 
-    pub fn finish(mut self) -> BytesMut {
-        self.write_buffer.clear();
+    pub fn finish(mut self) -> WriteBuffer {
+        self.write_buffer.bytes.clear();
         self.write_buffer
     }
 
     pub async fn progress(
         &mut self,
         stream: &mut AnyStream,
-    ) -> Result<Option<SendResponseEvent<C>>, StreamError> {
+    ) -> Result<Option<SendResponseEvent<C>>, WriteError> {
         let current_response = match self.current_response.take() {
             Some(current_response) => {
                 // We are currently sending a response but the sending process was cancelled.
@@ -54,7 +53,7 @@ impl<C: Encoder> SendResponseState<C> {
                 current_response
             }
             None => {
-                assert!(self.write_buffer.is_empty());
+                assert!(self.write_buffer.bytes.is_empty());
 
                 let Some(queued_response) = self.queued_responses.pop_front() else {
                     // There is currently no response that needs to be sent
@@ -89,7 +88,7 @@ struct QueuedResponse<C: Encoder> {
 }
 
 impl<C: Encoder> QueuedResponse<C> {
-    fn push_to_buffer(self, write_buffer: &mut BytesMut, codec: &C) -> CurrentResponse<C> {
+    fn push_to_buffer(self, write_buffer: &mut WriteBuffer, codec: &C) -> CurrentResponse<C> {
         for fragment in codec.encode(&self.response) {
             let data = match fragment {
                 Fragment::Line { data } => data,
@@ -99,7 +98,7 @@ impl<C: Encoder> QueuedResponse<C> {
                 //       see https://github.com/duesee/imap-codec/issues/332
                 Fragment::Literal { data, .. } => data,
             };
-            write_buffer.extend(data);
+            write_buffer.bytes.extend(data);
         }
 
         CurrentResponse {
