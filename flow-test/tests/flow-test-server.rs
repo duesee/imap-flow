@@ -155,3 +155,33 @@ fn login_with_rejected_literal() {
         rt.run2_and_select(client.receive(status), server.progress_internal_responses());
     }
 }
+
+#[test]
+fn command_larger_than_max_command_size() {
+    // The server will reject the command because it's larger than the max size
+    let max_command_size_tests = [9, 10, 20, 100, 10 * 1024 * 1024];
+
+    for max_command_size in max_command_size_tests {
+        let mut setup = TestSetup::default();
+        setup.server_flow_options.max_command_size = max_command_size as u32;
+
+        let (rt, mut server, mut client) = setup.setup_server();
+
+        let greeting = b"* OK ...\r\n";
+        rt.run2(server.send_greeting(greeting), client.receive(greeting));
+
+        // Command smaller than the max size can be received
+        let small_command = b"A1 NOOP\r\n";
+        rt.run2(
+            client.send(small_command),
+            server.receive_command(small_command),
+        );
+
+        // Command larger than the max size triggers an error
+        let large_command = &vec![b'.'; max_command_size + 1];
+        rt.run2(
+            client.send(large_command),
+            server.receive_error_because_command_too_long(&large_command[..max_command_size]),
+        );
+    }
+}

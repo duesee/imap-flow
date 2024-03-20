@@ -262,13 +262,20 @@ fn handle_client_event(
             }
             | ServerFlowError::LiteralTooLong {
                 ref discarded_bytes,
+            }
+            | ServerFlowError::CommandTooLong {
+                ref discarded_bytes,
             }),
         ) => {
             error!(role = "c2p", %error, ?discarded_bytes, "Discard client message");
             return ControlFlow::Continue;
         }
-        Err(ServerFlowError::Stream(error)) => {
-            error!(role = "c2p", %error, "Connection terminated");
+        Err(ServerFlowError::StreamClosed) => {
+            error!(role = "c2p", "Stream closed");
+            return ControlFlow::Abort;
+        }
+        Err(ServerFlowError::Io(error)) => {
+            error!(role = "c2p", %error, "IO error");
             return ControlFlow::Abort;
         }
     };
@@ -341,8 +348,12 @@ fn handle_server_event(
             error!(role = "c2p", %error, ?discarded_bytes, "Discard server message");
             return ControlFlow::Continue;
         }
-        Err(ClientFlowError::Stream(error)) => {
-            error!(role = "s2p", %error, "Connection terminated");
+        Err(ClientFlowError::StreamClosed) => {
+            error!(role = "s2p", "Stream closed");
+            return ControlFlow::Abort;
+        }
+        Err(ClientFlowError::Io(error)) => {
+            error!(role = "s2p", %error, "IO error");
             return ControlFlow::Abort;
         }
     };

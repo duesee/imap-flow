@@ -1,8 +1,8 @@
 use bounded_static::IntoBoundedStatic;
-use bytes::{Buf, BytesMut};
+use bytes::Buf;
 use imap_codec::decode::Decoder;
 
-use crate::stream::{AnyStream, StreamError};
+use crate::stream::{AnyStream, ReadBuffer, ReadError};
 
 pub struct ReceiveState<C> {
     codec: C,
@@ -14,11 +14,11 @@ pub struct ReceiveState<C> {
     seen_bytes: usize,
     // Used for reading the current message from the stream.
     // Its length should always be equal to or greater than `seen_bytes`.
-    read_buffer: BytesMut,
+    read_buffer: ReadBuffer,
 }
 
 impl<C> ReceiveState<C> {
-    pub fn new(codec: C, crlf_relaxed: bool, read_buffer: BytesMut) -> Self {
+    pub fn new(codec: C, crlf_relaxed: bool, read_buffer: ReadBuffer) -> Self {
         Self {
             codec,
             crlf_relaxed,
@@ -30,22 +30,27 @@ impl<C> ReceiveState<C> {
 
     pub fn start_literal(&mut self, length: u32) {
         self.next_fragment = NextFragment::Literal { length };
-        self.read_buffer.reserve(length as usize);
+        self.read_buffer.bytes.reserve(length as usize);
     }
 
     pub fn finish_message(&mut self) {
-        self.read_buffer.advance(self.seen_bytes);
+        self.read_buffer.bytes.advance(self.seen_bytes);
         self.seen_bytes = 0;
         self.next_fragment = NextFragment::start_new_line();
     }
 
     pub fn discard_message(&mut self) -> Box<[u8]> {
-        let discarded_bytes = self.read_buffer[..self.seen_bytes].into();
+        let discarded_bytes = self.read_buffer.bytes[..self.seen_bytes].into();
         self.finish_message();
         discarded_bytes
     }
 
-    pub async fn progress(&mut self, stream: &mut AnyStream) -> Result<ReceiveEvent<C>, StreamError>
+    pub fn discard_all_bytes(&mut self) -> Box<[u8]> {
+        self.seen_bytes = self.read_buffer.bytes.len();
+        self.discard_message()
+    }
+
+    pub async fn progress(&mut self, stream: &mut AnyStream) -> Result<ReceiveEvent<C>, ReadError>
     where
         C: Decoder,
         for<'a> C::Message<'a>: IntoBoundedStatic<Static = C::Message<'static>>,
@@ -69,21 +74,21 @@ impl<C> ReceiveState<C> {
         &mut self,
         stream: &mut AnyStream,
         seen_bytes_in_line: usize,
-    ) -> Result<Option<ReceiveEvent<C>>, StreamError>
+    ) -> Result<Option<ReceiveEvent<C>>, ReadError>
     where
         C: Decoder,
         for<'a> C::Message<'a>: IntoBoundedStatic<Static = C::Message<'static>>,
         for<'a> C::Error<'a>: IntoBoundedStatic<Static = C::Error<'static>>,
     {
         let Some(crlf_result) = find_crlf(
-            &self.read_buffer[self.seen_bytes..],
+            &self.read_buffer.bytes[self.seen_bytes..],
             seen_bytes_in_line,
             self.crlf_relaxed,
         ) else {
             // No full line received yet, more data needed.
 
             // Mark the bytes of the partial line as seen.
-            let seen_bytes_in_line = self.read_buffer.len() - self.seen_bytes;
+            let seen_bytes_in_line = self.read_buffer.bytes.len() - self.seen_bytes;
             self.next_fragment = NextFragment::Line { seen_bytes_in_line };
 
             // Read more data.
@@ -104,7 +109,10 @@ impl<C> ReceiveState<C> {
         // TODO(#129): If the message is really long and we need multiple attempts to receive it,
         //             then this is O(n^2). IMO this can be only fixed by using a generator-like
         //             decoder.
-        match self.codec.decode(&self.read_buffer[..self.seen_bytes]) {
+        match self
+            .codec
+            .decode(&self.read_buffer.bytes[..self.seen_bytes])
+        {
             Ok((remaining, message)) => {
                 assert!(remaining.is_empty());
                 Ok(Some(ReceiveEvent::DecodingSuccess(message.into_static())))
@@ -117,8 +125,8 @@ impl<C> ReceiveState<C> {
         &mut self,
         stream: &mut AnyStream,
         literal_length: u32,
-    ) -> Result<(), StreamError> {
-        let unseen_bytes = self.read_buffer.len() - self.seen_bytes;
+    ) -> Result<(), ReadError> {
+        let unseen_bytes = self.read_buffer.bytes.len() - self.seen_bytes;
 
         if unseen_bytes < literal_length as usize {
             // We did not receive enough bytes for the literal yet.
