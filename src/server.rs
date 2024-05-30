@@ -2,8 +2,7 @@ use std::fmt::{Debug, Formatter};
 
 use bounded_static::ToBoundedStatic;
 use imap_codec::{
-    decode::{AuthenticateDataDecodeError, CommandDecodeError, IdleDoneDecodeError},
-    CommandCodec, GreetingCodec, ResponseCodec,
+    AuthenticateDataCodec, CommandCodec, GreetingCodec, IdleDoneCodec, ResponseCodec,
 };
 use imap_types::{
     auth::AuthenticateData,
@@ -21,7 +20,6 @@ use thiserror::Error;
 use crate::{
     handle::{Handle, HandleGenerator, HandleGeneratorGenerator, RawHandle},
     receive::{ReceiveError, ReceiveEvent, ReceiveState},
-    server_receive::{NextExpectedMessage, ServerReceiveState},
     server_send::{ServerSendEvent, ServerSendState},
     types::CommandAuthenticate,
     Interrupt, State,
@@ -114,27 +112,25 @@ pub struct Server {
     options: Options,
     handle_generator: HandleGenerator<ResponseHandle>,
     send_state: ServerSendState,
-    receive_state: ServerReceiveState,
+    receive_state: ReceiveState,
+    next_expected_message: NextExpectedMessage,
 }
 
 impl Server {
     pub fn new(options: Options, greeting: Greeting<'static>) -> Self {
         let mut send_state =
             ServerSendState::new(GreetingCodec::default(), ResponseCodec::default());
-
         send_state.enqueue_greeting(greeting);
 
-        let receive_state = ServerReceiveState::Command(ReceiveState::new(
-            CommandCodec::default(),
-            options.crlf_relaxed,
-            Some(options.max_command_size),
-        ));
+        let receive_state = ReceiveState::new(options.crlf_relaxed, Some(options.max_command_size));
+        let next_expected_message = NextExpectedMessage::Command(CommandCodec::default());
 
         Self {
             options,
             handle_generator: HANDLE_GENERATOR_GENERATOR.generate(),
             send_state,
             receive_state,
+            next_expected_message,
         }
     }
 
@@ -206,52 +202,47 @@ impl Server {
     }
 
     fn progress_receive(&mut self) -> Result<Option<Event>, Interrupt<Error>> {
-        match &mut self.receive_state {
-            ServerReceiveState::Command(state) => {
-                match state.next() {
-                    Ok(ReceiveEvent::DecodingSuccess(command)) => {
-                        state.finish_message();
+        match &self.next_expected_message {
+            NextExpectedMessage::Command(codec) => match self
+                .receive_state
+                .next::<CommandCodec>(codec)
+            {
+                Ok(ReceiveEvent::DecodingSuccess(command)) => match command.body {
+                    CommandBody::Authenticate {
+                        mechanism,
+                        initial_response,
+                    } => {
+                        self.next_expected_message =
+                            NextExpectedMessage::AuthenticateData(AuthenticateDataCodec::default());
 
-                        match command.body {
-                            CommandBody::Authenticate {
+                        Ok(Some(Event::CommandAuthenticateReceived {
+                            command_authenticate: CommandAuthenticate {
+                                tag: command.tag,
                                 mechanism,
                                 initial_response,
-                            } => {
-                                self.receive_state
-                                    .change_state(NextExpectedMessage::AuthenticateData);
-
-                                Ok(Some(Event::CommandAuthenticateReceived {
-                                    command_authenticate: CommandAuthenticate {
-                                        tag: command.tag,
-                                        mechanism,
-                                        initial_response,
-                                    },
-                                }))
-                            }
-                            CommandBody::Idle => {
-                                self.receive_state
-                                    .change_state(NextExpectedMessage::IdleAccept);
-
-                                Ok(Some(Event::IdleCommandReceived { tag: command.tag }))
-                            }
-                            body => Ok(Some(Event::CommandReceived {
-                                command: Command {
-                                    tag: command.tag,
-                                    body,
-                                },
-                            })),
-                        }
+                            },
+                        }))
                     }
-                    Err(Interrupt::Io(io)) => Err(Interrupt::Io(io)),
-                    Err(Interrupt::Error(ReceiveError::DecodingFailure(
-                        CommandDecodeError::LiteralFound { tag, length, mode },
-                    ))) => {
-                        if length > self.options.max_literal_size {
-                            match mode {
-                                LiteralMode::Sync => {
-                                    // Inform the client that the literal was rejected.
+                    CommandBody::Idle => {
+                        self.next_expected_message = NextExpectedMessage::IdleAccept;
 
-                                    // Unwrap: This should never fail because the text is not Base64.
+                        Ok(Some(Event::IdleCommandReceived { tag: command.tag }))
+                    }
+                    body => Ok(Some(Event::CommandReceived {
+                        command: Command {
+                            tag: command.tag,
+                            body,
+                        },
+                    })),
+                },
+                Ok(ReceiveEvent::LiteralAnnouncement { mode, length }) => {
+                    if length > self.options.max_literal_size {
+                        match mode {
+                            LiteralMode::Sync => {
+                                // Inform the client that the literal was rejected.
+                                if let Some(tag) = self.receive_state.message_tag() {
+                                    // Unwrap: This should never fail because the text is
+                                    // not Base64.
                                     let status = Status::bad(
                                         Some(tag),
                                         None,
@@ -261,143 +252,98 @@ impl Server {
                                     self.send_state
                                         .enqueue_response(None, Response::Status(status));
 
-                                    let discarded_bytes = state.discard_message();
+                                    let discarded_bytes = self.receive_state.discard_message();
 
-                                    Err(Interrupt::Error(Error::LiteralTooLong {
-                                        discarded_bytes: Secret::new(discarded_bytes),
-                                    }))
-                                }
-                                LiteralMode::NonSync => {
-                                    // TODO: We can't (reliably) make the client stop sending data.
-                                    //       Some actions that come to mind:
-                                    //       * terminate the connection
-                                    //       * act as a "discard server", i.e., consume the full
-                                    //         literal w/o saving it, and answering with `BAD`
-                                    //       * ...
-                                    //
-                                    //       The LITERAL+ RFC has some recommendations.
-                                    let discarded_bytes = state.discard_message();
+                                    Err(Interrupt::Error(Error::LiteralTooLong { discarded_bytes }))
+                                } else {
+                                    // We need a tag for rejecting the literal, but the
+                                    // message seems to be malformed because it contains no
+                                    // tag. Discarding the message immediately would be
+                                    // dangerous because the literal might contain bytes that
+                                    // look like IMAP commands. Doing nothing might lead
+                                    // to a deadlock because the client is waiting for a
+                                    // response. We prefer the latter because it is more safe.
+                                    // If we receive the complete message for whatever reason,
+                                    // we need to make sure that it will be discarded.
+                                    // Note that `max_command_size` will still prevent
+                                    // allocation of unlimited memory.
+                                    self.receive_state.poison_message();
 
-                                    Err(Interrupt::Error(Error::LiteralTooLong {
-                                        discarded_bytes: Secret::new(discarded_bytes),
-                                    }))
+                                    Ok(None)
                                 }
                             }
-                        } else {
-                            state.start_literal(length);
+                            LiteralMode::NonSync => {
+                                // We can't (reliably) make the client stop sending data.
+                                // Discarding the message immediately would be dangerous
+                                // because the literal might contain bytes that look like
+                                // IMAP commands. So instead we continue receiving the
+                                // message but discard it afterwards. Note that
+                                // `max_command_size` will still prevent allocation of
+                                // unlimited memory.
+                                self.receive_state.poison_message();
 
-                            match mode {
-                                LiteralMode::Sync => {
-                                    // Inform the client that the literal was accepted.
-
-                                    // Unwrap: This should never fail because the text is not Base64.
-                                    let cont = CommandContinuationRequest::basic(
-                                        None,
-                                        self.options.literal_accept_text().to_static(),
-                                    )
-                                    .unwrap();
-                                    self.send_state.enqueue_response(
-                                        None,
-                                        Response::CommandContinuationRequest(cont),
-                                    );
-                                }
-                                LiteralMode::NonSync => {
-                                    // We don't need to inform the client because non-sync literals
-                                    // are automatically accepted.
-                                }
+                                Ok(None)
                             }
-
-                            Ok(None)
                         }
+                    } else {
+                        match mode {
+                            LiteralMode::Sync => {
+                                // Inform the client that the literal was accepted.
+
+                                // Unwrap: This should never fail because the text is not Base64.
+                                let cont = CommandContinuationRequest::basic(
+                                    None,
+                                    self.options.literal_accept_text().to_static(),
+                                )
+                                .unwrap();
+                                self.send_state.enqueue_response(
+                                    None,
+                                    Response::CommandContinuationRequest(cont),
+                                );
+                            }
+                            LiteralMode::NonSync => {
+                                // We don't need to inform the client because non-sync literals
+                                // are automatically accepted.
+                            }
+                        }
+
+                        Ok(None)
                     }
-                    Err(Interrupt::Error(ReceiveError::DecodingFailure(
-                        CommandDecodeError::Failed | CommandDecodeError::Incomplete,
-                    ))) => {
-                        let discarded_bytes = state.discard_message();
-                        Err(Interrupt::Error(Error::MalformedMessage {
-                            discarded_bytes: Secret::new(discarded_bytes),
-                        }))
+                }
+                Err(interrupt) => Err(handle_receive_interrupt(interrupt)),
+            },
+            NextExpectedMessage::AuthenticateData(codec) => {
+                match self.receive_state.next::<AuthenticateDataCodec>(codec) {
+                    Ok(ReceiveEvent::DecodingSuccess(authenticate_data)) => {
+                        Ok(Some(Event::AuthenticateDataReceived { authenticate_data }))
                     }
-                    Err(Interrupt::Error(ReceiveError::ExpectedCrlfGotLf)) => {
-                        let discarded_bytes = state.discard_message();
-                        Err(Interrupt::Error(Error::ExpectedCrlfGotLf {
-                            discarded_bytes: Secret::new(discarded_bytes),
-                        }))
+                    Ok(ReceiveEvent::LiteralAnnouncement { .. }) => {
+                        // Unexpected literal, let's continue and see what happen
+                        Ok(None)
                     }
-                    Err(Interrupt::Error(ReceiveError::MessageTooLong)) => {
-                        let discarded_bytes = state.discard_message();
-                        Err(Interrupt::Error(Error::CommandTooLong {
-                            discarded_bytes: Secret::new(discarded_bytes),
-                        }))
-                    }
+                    Err(interrupt) => Err(handle_receive_interrupt(interrupt)),
                 }
             }
-            ServerReceiveState::AuthenticateData(state) => match state.next() {
-                Ok(ReceiveEvent::DecodingSuccess(authenticate_data)) => {
-                    state.finish_message();
-                    Ok(Some(Event::AuthenticateDataReceived { authenticate_data }))
-                }
-                Err(Interrupt::Io(io)) => Err(Interrupt::Io(io)),
-                Err(Interrupt::Error(ReceiveError::DecodingFailure(
-                    AuthenticateDataDecodeError::Failed | AuthenticateDataDecodeError::Incomplete,
-                ))) => {
-                    let discarded_bytes = state.discard_message();
-                    Err(Interrupt::Error(Error::MalformedMessage {
-                        discarded_bytes: Secret::new(discarded_bytes),
-                    }))
-                }
-                Err(Interrupt::Error(ReceiveError::ExpectedCrlfGotLf)) => {
-                    let discarded_bytes = state.discard_message();
-                    Err(Interrupt::Error(Error::ExpectedCrlfGotLf {
-                        discarded_bytes: Secret::new(discarded_bytes),
-                    }))
-                }
-                Err(Interrupt::Error(ReceiveError::MessageTooLong)) => {
-                    let discarded_bytes = state.discard_message();
-                    Err(Interrupt::Error(Error::CommandTooLong {
-                        discarded_bytes: Secret::new(discarded_bytes),
-                    }))
-                }
-            },
-            ServerReceiveState::IdleAccept(_) => {
+            NextExpectedMessage::IdleAccept => {
                 // We don't expect any message until the server user calls
                 // `idle_accept` or `idle_reject`.
                 // TODO: It's strange to return NeedMoreInput here, but it works for now.
                 Err(Interrupt::Io(crate::Io::NeedMoreInput))
             }
-            ServerReceiveState::IdleDone(state) => match state.next() {
-                Ok(ReceiveEvent::DecodingSuccess(IdleDone)) => {
-                    state.finish_message();
+            NextExpectedMessage::IdleDone(codec) => {
+                match self.receive_state.next::<IdleDoneCodec>(codec) {
+                    Ok(ReceiveEvent::DecodingSuccess(IdleDone)) => {
+                        self.next_expected_message =
+                            NextExpectedMessage::Command(CommandCodec::default());
 
-                    self.receive_state
-                        .change_state(NextExpectedMessage::Command);
-
-                    Ok(Some(Event::IdleDoneReceived))
+                        Ok(Some(Event::IdleDoneReceived))
+                    }
+                    Ok(ReceiveEvent::LiteralAnnouncement { .. }) => {
+                        // Unexpected literal, let's continue and see what happen
+                        Ok(None)
+                    }
+                    Err(interrupt) => Err(handle_receive_interrupt(interrupt)),
                 }
-                Err(Interrupt::Io(io)) => Err(Interrupt::Io(io)),
-                Err(Interrupt::Error(ReceiveError::DecodingFailure(
-                    IdleDoneDecodeError::Failed | IdleDoneDecodeError::Incomplete,
-                ))) => {
-                    let discarded_bytes = state.discard_message();
-                    Err(Interrupt::Error(Error::MalformedMessage {
-                        discarded_bytes: Secret::new(discarded_bytes),
-                    }))
-                }
-                Err(Interrupt::Error(ReceiveError::ExpectedCrlfGotLf)) => {
-                    let discarded_bytes = state.discard_message();
-                    Err(Interrupt::Error(Error::ExpectedCrlfGotLf {
-                        discarded_bytes: Secret::new(discarded_bytes),
-                    }))
-                }
-                Err(Interrupt::Error(ReceiveError::MessageTooLong)) => {
-                    let discarded_bytes = state.discard_message();
-                    Err(Interrupt::Error(Error::CommandTooLong {
-                        discarded_bytes: Secret::new(discarded_bytes),
-                    }))
-                }
-            },
-            ServerReceiveState::Dummy => {
-                unreachable!()
             }
         }
     }
@@ -406,7 +352,7 @@ impl Server {
         &mut self,
         continuation_request: CommandContinuationRequest<'static>,
     ) -> Result<ResponseHandle, CommandContinuationRequest<'static>> {
-        if let ServerReceiveState::AuthenticateData { .. } = self.receive_state {
+        if let NextExpectedMessage::AuthenticateData { .. } = self.next_expected_message {
             let handle = self.enqueue_continuation_request(continuation_request);
             Ok(handle)
         } else {
@@ -418,11 +364,10 @@ impl Server {
         &mut self,
         status: Status<'static>,
     ) -> Result<ResponseHandle, Status<'static>> {
-        if let ServerReceiveState::AuthenticateData(_) = &mut self.receive_state {
+        if let NextExpectedMessage::AuthenticateData(_) = &mut self.next_expected_message {
             let handle = self.enqueue_status(status);
 
-            self.receive_state
-                .change_state(NextExpectedMessage::Command);
+            self.next_expected_message = NextExpectedMessage::Command(CommandCodec::default());
 
             Ok(handle)
         } else {
@@ -434,11 +379,10 @@ impl Server {
         &mut self,
         continuation_request: CommandContinuationRequest<'static>,
     ) -> Result<ResponseHandle, CommandContinuationRequest<'static>> {
-        if let ServerReceiveState::IdleAccept(_) = &mut self.receive_state {
+        if let NextExpectedMessage::IdleAccept = &mut self.next_expected_message {
             let handle = self.enqueue_continuation_request(continuation_request);
 
-            self.receive_state
-                .change_state(NextExpectedMessage::IdleDone);
+            self.next_expected_message = NextExpectedMessage::IdleDone(IdleDoneCodec::default());
 
             Ok(handle)
         } else {
@@ -450,11 +394,10 @@ impl Server {
         &mut self,
         status: Status<'static>,
     ) -> Result<ResponseHandle, Status<'static>> {
-        if let ServerReceiveState::IdleAccept(_) = &mut self.receive_state {
+        if let NextExpectedMessage::IdleAccept = &mut self.next_expected_message {
             let handle = self.enqueue_status(status);
 
-            self.receive_state
-                .change_state(NextExpectedMessage::Command);
+            self.next_expected_message = NextExpectedMessage::Command(CommandCodec::default());
 
             Ok(handle)
         } else {
@@ -477,13 +420,7 @@ impl State for Server {
     type Error = Error;
 
     fn enqueue_input(&mut self, bytes: &[u8]) {
-        match &mut self.receive_state {
-            ServerReceiveState::Command(state) => state.enqueue_input(bytes),
-            ServerReceiveState::AuthenticateData(state) => state.enqueue_input(bytes),
-            ServerReceiveState::IdleAccept(state) => state.enqueue_input(bytes),
-            ServerReceiveState::IdleDone(state) => state.enqueue_input(bytes),
-            ServerReceiveState::Dummy => unreachable!(),
-        }
+        self.receive_state.enqueue_input(bytes);
     }
 
     fn next(&mut self) -> Result<Self::Event, Interrupt<Self::Error>> {
@@ -495,6 +432,24 @@ impl State for Server {
             if let Some(event) = self.progress_receive()? {
                 return Ok(event);
             }
+        }
+    }
+}
+
+fn handle_receive_interrupt(receive_interrupt: Interrupt<ReceiveError>) -> Interrupt<Error> {
+    match receive_interrupt {
+        Interrupt::Io(io) => Interrupt::Io(io),
+        Interrupt::Error(ReceiveError::DecodingFailure { discarded_bytes }) => {
+            Interrupt::Error(Error::MalformedMessage { discarded_bytes })
+        }
+        Interrupt::Error(ReceiveError::ExpectedCrlfGotLf { discarded_bytes }) => {
+            Interrupt::Error(Error::ExpectedCrlfGotLf { discarded_bytes })
+        }
+        Interrupt::Error(ReceiveError::MessageIsPoisoned { discarded_bytes }) => {
+            Interrupt::Error(Error::MalformedMessage { discarded_bytes })
+        }
+        Interrupt::Error(ReceiveError::MessageTooLong { discarded_bytes }) => {
+            Interrupt::Error(Error::CommandTooLong { discarded_bytes })
         }
     }
 }
@@ -579,4 +534,12 @@ pub enum Error {
     LiteralTooLong { discarded_bytes: Secret<Box<[u8]>> },
     #[error("Command is too long")]
     CommandTooLong { discarded_bytes: Secret<Box<[u8]>> },
+}
+
+#[derive(Clone, Debug)]
+enum NextExpectedMessage {
+    Command(CommandCodec),
+    AuthenticateData(AuthenticateDataCodec),
+    IdleAccept,
+    IdleDone(IdleDoneCodec),
 }
