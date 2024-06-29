@@ -27,6 +27,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f26201604c87b1e01bd3d98f8d5d9a8fcbb815e8cedb41ffccbeb4bf593a35fe"
 
 [[package]]
+name = "ahash"
+version = "0.8.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e89da841a80418a9b391ebaea17f5c112ffaaa96f621d2c285b5174da76b9011"
+dependencies = [
+ "cfg-if",
+ "once_cell",
+ "version_check",
+ "zerocopy",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -168,6 +180,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b2325bd33fa7e3018e7e37f5b0591ba009124963b5a3f8b7cae6d0a8c1028ed4"
 dependencies = [
  "bounded-static-derive",
+]
+
+[[package]]
+name = "bounded-static"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0beb903daa49b43bcafb5d5eebe633f9ad638d8b16cd08f95fb05ee7bd099321"
+dependencies = [
+ "ahash",
+ "chrono",
 ]
 
 [[package]]
@@ -362,7 +384,7 @@ source = "git+https://github.com/duesee/imap-codec?rev=6aa651f6c74a4feb6696e7fb3
 dependencies = [
  "abnf-core",
  "base64 0.21.7",
- "bounded-static",
+ "bounded-static 0.5.0",
  "chrono",
  "imap-types",
  "log",
@@ -374,7 +396,7 @@ dependencies = [
 name = "imap-next"
 version = "0.1.0"
 dependencies = [
- "bounded-static",
+ "bounded-static 0.8.0",
  "bytes",
  "imap-codec",
  "imap-types",
@@ -393,7 +415,7 @@ version = "2.0.0-alpha.1"
 source = "git+https://github.com/duesee/imap-codec?rev=6aa651f6c74a4feb6696e7fb3e4c31b55ba64036#6aa651f6c74a4feb6696e7fb3e4c31b55ba64036"
 dependencies = [
  "base64 0.21.7",
- "bounded-static",
+ "bounded-static 0.5.0",
  "chrono",
  "thiserror",
 ]
@@ -1197,6 +1219,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "830b7e5d4d90034032940e4ace0d9a9a057e7a45cd94e6c007832e39edb82f6d"
 
 [[package]]
+name = "version_check"
+version = "0.9.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "49874b5167b65d7193b8aba1567f5c7d93d001cafc34600cee003eda787e483f"
+
+[[package]]
 name = "wasi"
 version = "0.11.0+wasi-snapshot-preview1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1382,6 +1410,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "59b5e5f6c299a3c7890b876a2a587f3115162487e704907d9b6cd29473052ba1"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "zerocopy"
+version = "0.7.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae87e3fcd617500e5d106f0380cf7b77f3c6092aae37191433159dda23cfb087"
+dependencies = [
+ "zerocopy-derive",
+]
+
+[[package]]
+name = "zerocopy-derive"
+version = "0.7.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15e934569e47891f7d9411f1a451d947a60e000ab3bd24fbb970f000387d1b3b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
