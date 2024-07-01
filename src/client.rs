@@ -1,8 +1,7 @@
 use std::fmt::{Debug, Formatter};
 
 use imap_codec::{
-    decode::{GreetingDecodeError, ResponseDecodeError},
-    AuthenticateDataCodec, CommandCodec, GreetingCodec, IdleDoneCodec,
+    AuthenticateDataCodec, CommandCodec, GreetingCodec, IdleDoneCodec, ResponseCodec,
 };
 use imap_types::{
     auth::AuthenticateData,
@@ -13,7 +12,6 @@ use imap_types::{
 use thiserror::Error;
 
 use crate::{
-    client_receive::ClientReceiveState,
     client_send::{ClientSendEvent, ClientSendState, ClientSendTermination},
     handle::{Handle, HandleGenerator, HandleGeneratorGenerator, RawHandle},
     receive::{ReceiveError, ReceiveEvent, ReceiveState},
@@ -43,7 +41,8 @@ impl Default for Options {
 pub struct Client {
     handle_generator: HandleGenerator<CommandHandle>,
     send_state: ClientSendState,
-    receive_state: ClientReceiveState,
+    receive_state: ReceiveState,
+    next_expected_message: NextExpectedMessage,
 }
 
 impl Client {
@@ -54,16 +53,14 @@ impl Client {
             IdleDoneCodec::default(),
         );
 
-        let receive_state = ClientReceiveState::Greeting(ReceiveState::new(
-            GreetingCodec::default(),
-            options.crlf_relaxed,
-            None,
-        ));
+        let receive_state = ReceiveState::new(options.crlf_relaxed, None);
+        let next_expected_message = NextExpectedMessage::Greeting(GreetingCodec::default());
 
         Self {
             handle_generator: HANDLE_GENERATOR_GENERATOR.generate(),
             send_state,
             receive_state,
+            next_expected_message,
         }
     }
 
@@ -80,7 +77,7 @@ impl Client {
 
     fn progress_send(&mut self) -> Result<Option<Event>, Interrupt<Error>> {
         // Abort if we didn't received the greeting yet
-        if let ClientReceiveState::Greeting(_) = &self.receive_state {
+        if let NextExpectedMessage::Greeting(_) = &self.next_expected_message {
             return Ok(None);
         }
 
@@ -105,67 +102,29 @@ impl Client {
 
     fn progress_receive(&mut self) -> Result<Option<Event>, Interrupt<Error>> {
         let event = loop {
-            match &mut self.receive_state {
-                ClientReceiveState::Greeting(state) => {
-                    match state.next() {
+            match &self.next_expected_message {
+                NextExpectedMessage::Greeting(codec) => {
+                    match self.receive_state.next::<GreetingCodec>(codec) {
                         Ok(ReceiveEvent::DecodingSuccess(greeting)) => {
-                            state.finish_message();
-                            self.receive_state.change_state();
+                            self.next_expected_message =
+                                NextExpectedMessage::Response(ResponseCodec::default());
                             break Some(Event::GreetingReceived { greeting });
                         }
-                        Err(Interrupt::Io(io)) => return Err(Interrupt::Io(io)),
-                        Err(Interrupt::Error(ReceiveError::DecodingFailure(
-                            GreetingDecodeError::Failed | GreetingDecodeError::Incomplete,
-                        ))) => {
-                            let discarded_bytes = state.discard_message();
-                            return Err(Interrupt::Error(Error::MalformedMessage {
-                                discarded_bytes: Secret::new(discarded_bytes),
-                            }));
-                        }
-                        Err(Interrupt::Error(ReceiveError::ExpectedCrlfGotLf)) => {
-                            let discarded_bytes = state.discard_message();
-                            return Err(Interrupt::Error(Error::ExpectedCrlfGotLf {
-                                discarded_bytes: Secret::new(discarded_bytes),
-                            }));
-                        }
-                        Err(Interrupt::Error(ReceiveError::MessageTooLong)) => {
-                            // Unreachable because message limit is not set
-                            unreachable!()
-                        }
-                    }
-                }
-                ClientReceiveState::Response(state) => {
-                    let response = match state.next() {
-                        Ok(ReceiveEvent::DecodingSuccess(response)) => {
-                            state.finish_message();
-                            response
-                        }
-                        Err(Interrupt::Io(io)) => return Err(Interrupt::Io(io)),
-                        Err(Interrupt::Error(ReceiveError::DecodingFailure(
-                            ResponseDecodeError::LiteralFound { length },
-                        ))) => {
-                            // The client must accept the literal in any case.
-                            state.start_literal(length);
+                        Ok(ReceiveEvent::LiteralAnnouncement { .. }) => {
+                            // Unexpected literal, let's continue and see what happen
                             continue;
                         }
-                        Err(Interrupt::Error(ReceiveError::DecodingFailure(
-                            ResponseDecodeError::Failed | ResponseDecodeError::Incomplete,
-                        ))) => {
-                            let discarded_bytes = state.discard_message();
-                            return Err(Interrupt::Error(Error::MalformedMessage {
-                                discarded_bytes: Secret::new(discarded_bytes),
-                            }));
+                        Err(interrupt) => return Err(handle_receive_interrupt(interrupt)),
+                    }
+                }
+                NextExpectedMessage::Response(codec) => {
+                    let response = match self.receive_state.next::<ResponseCodec>(codec) {
+                        Ok(ReceiveEvent::DecodingSuccess(response)) => response,
+                        Ok(ReceiveEvent::LiteralAnnouncement { .. }) => {
+                            // The client must accept the literal in any case.
+                            continue;
                         }
-                        Err(Interrupt::Error(ReceiveError::ExpectedCrlfGotLf)) => {
-                            let discarded_bytes = state.discard_message();
-                            return Err(Interrupt::Error(Error::ExpectedCrlfGotLf {
-                                discarded_bytes: Secret::new(discarded_bytes),
-                            }));
-                        }
-                        Err(Interrupt::Error(ReceiveError::MessageTooLong)) => {
-                            // Unreachable because message limit is not set
-                            unreachable!()
-                        }
+                        Err(interrupt) => return Err(handle_receive_interrupt(interrupt)),
                     };
 
                     match response {
@@ -228,9 +187,6 @@ impl Client {
                         }
                     }
                 }
-                ClientReceiveState::Dummy => {
-                    unreachable!()
-                }
             }
         };
 
@@ -262,11 +218,7 @@ impl State for Client {
     type Error = Error;
 
     fn enqueue_input(&mut self, bytes: &[u8]) {
-        match &mut self.receive_state {
-            ClientReceiveState::Greeting(state) => state.enqueue_input(bytes),
-            ClientReceiveState::Response(state) => state.enqueue_input(bytes),
-            ClientReceiveState::Dummy => unreachable!(),
-        }
+        self.receive_state.enqueue_input(bytes);
     }
 
     fn next(&mut self) -> Result<Self::Event, Interrupt<Self::Error>> {
@@ -278,6 +230,26 @@ impl State for Client {
             if let Some(event) = self.progress_receive()? {
                 return Ok(event);
             }
+        }
+    }
+}
+
+fn handle_receive_interrupt(interrupt: Interrupt<ReceiveError>) -> Interrupt<Error> {
+    match interrupt {
+        Interrupt::Io(io) => Interrupt::Io(io),
+        Interrupt::Error(ReceiveError::DecodingFailure { discarded_bytes }) => {
+            Interrupt::Error(Error::MalformedMessage { discarded_bytes })
+        }
+        Interrupt::Error(ReceiveError::ExpectedCrlfGotLf { discarded_bytes }) => {
+            Interrupt::Error(Error::ExpectedCrlfGotLf { discarded_bytes })
+        }
+        Interrupt::Error(ReceiveError::MessageIsPoisoned { .. }) => {
+            // Unreachable because we don't poison messages
+            unreachable!()
+        }
+        Interrupt::Error(ReceiveError::MessageTooLong { .. }) => {
+            // Unreachable because message limit is not set
+            unreachable!()
         }
     }
 }
@@ -381,4 +353,10 @@ pub enum Error {
     ExpectedCrlfGotLf { discarded_bytes: Secret<Box<[u8]>> },
     #[error("Received malformed message")]
     MalformedMessage { discarded_bytes: Secret<Box<[u8]>> },
+}
+
+#[derive(Clone, Debug)]
+pub enum NextExpectedMessage {
+    Greeting(GreetingCodec),
+    Response(ResponseCodec),
 }

@@ -1,12 +1,11 @@
 #![forbid(unsafe_code)]
 
 pub mod client;
-mod client_receive;
 mod client_send;
+pub mod fragmentizer;
 mod handle;
 mod receive;
 pub mod server;
-mod server_receive;
 mod server_send;
 #[cfg(feature = "stream")]
 pub mod stream;

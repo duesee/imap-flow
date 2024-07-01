@@ -199,9 +199,13 @@ fn command_larger_than_max_command_size() {
         );
 
         // Command larger than the max size triggers an error
-        let large_command = &vec![b'.'; max_command_size + 1];
+        let large_command = format!(
+            "{}\r\n",
+            String::from_utf8(vec![b'.'; max_command_size + 1]).unwrap(),
+        )
+        .into_bytes();
         rt.run2(
-            client.send(large_command),
+            client.send(&large_command),
             server.receive_error_because_command_too_long(&large_command[..max_command_size]),
         );
     }
@@ -234,7 +238,6 @@ fn command_with_literals_larger_than_max_command_size() {
         // Login command smaller than the max size can be received
         let login = b"A1 LOGIN {3}\r\nABC {3}\r\n...\r\n";
         let continuation_request = b"+ more data\r\n";
-        dbg!(login.len());
         rt.run2(
             async {
                 client.send(&login[..14]).await;
@@ -253,7 +256,6 @@ fn command_with_literals_larger_than_max_command_size() {
             String::from_utf8(vec![b'.'; password_size]).unwrap(),
         )
         .into_bytes();
-        dbg!(large_login.len());
         rt.run2(
             async {
                 client.send(&large_login[..14]).await;
