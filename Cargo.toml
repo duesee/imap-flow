@@ -18,7 +18,7 @@ expose_stream = []
 stream = ["dep:rustls", "dep:tokio", "dep:tokio-rustls"]
 
 [dependencies]
-bounded-static = "0.5.0"
+bounded-static = "0.8.0"
 bytes = "1.6.0"
 imap-codec = { version = "2.0.0-alpha.1", features = ["starttls", "quirk_crlf_relaxed", "bounded-static", "ext_condstore_qresync", "ext_login_referrals", "ext_mailbox_referrals", "ext_id", "ext_sort_thread", "ext_binary", "ext_metadata", "ext_uidplus"] }
 imap-types = { version = "2.0.0-alpha.1", features = ["starttls", "ext_condstore_qresync", "ext_login_referrals", "ext_mailbox_referrals", "ext_id", "ext_sort_thread", "ext_binary", "ext_metadata", "ext_uidplus"] }
